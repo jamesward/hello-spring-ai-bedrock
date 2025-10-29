@@ -10,11 +10,7 @@ kotlin {
 }
 
 dependencies {
+    implementation(platform("software.amazon.awssdk:bom:2.36.3"))
+    implementation(platform("org.springframework.ai:spring-ai-bom:1.0.3"))
     implementation("org.springframework.ai:spring-ai-starter-model-bedrock-converse")
-}
-
-dependencyManagement {
-    imports {
-        mavenBom("org.springframework.ai:spring-ai-bom:1.0.3")
-    }
 }
