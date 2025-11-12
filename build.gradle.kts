@@ -6,11 +6,10 @@ plugins {
 }
 
 kotlin {
-    jvmToolchain(17)
+    jvmToolchain(21)
 }
 
 dependencies {
-    implementation(platform("software.amazon.awssdk:bom:2.36.3"))
-    implementation(platform("org.springframework.ai:spring-ai-bom:1.0.3"))
+    implementation(platform("org.springframework.ai:spring-ai-bom:1.1.0-RC1"))
     implementation("org.springframework.ai:spring-ai-starter-model-bedrock-converse")
 }
