@@ -10,6 +10,6 @@ kotlin {
 }
 
 dependencies {
-    implementation(platform("org.springframework.ai:spring-ai-bom:1.1.0-RC1"))
+    implementation(platform("org.springframework.ai:spring-ai-bom:1.1.0"))
     implementation("org.springframework.ai:spring-ai-starter-model-bedrock-converse")
 }
