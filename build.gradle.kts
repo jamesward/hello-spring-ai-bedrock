@@ -6,15 +6,10 @@ plugins {
 }
 
 kotlin {
-    jvmToolchain(17)
+    jvmToolchain(21)
 }
 
 dependencies {
+    implementation(platform("org.springframework.ai:spring-ai-bom:1.1.0"))
     implementation("org.springframework.ai:spring-ai-starter-model-bedrock-converse")
-}
-
-dependencyManagement {
-    imports {
-        mavenBom("org.springframework.ai:spring-ai-bom:1.0.3")
-    }
 }
