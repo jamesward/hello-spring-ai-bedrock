@@ -11,5 +11,5 @@ kotlin {
 
 dependencies {
     implementation(platform("org.springframework.ai:spring-ai-bom:1.1.2"))
-    implementation("org.springframework.ai:spring-ai-starter-model-bedrock-converse")
+    implementation("org.springframework.ai:spring-ai-starter-model-openai-sdk")
 }
