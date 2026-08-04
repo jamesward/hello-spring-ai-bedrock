@@ -1,7 +1,7 @@
 plugins {
-    kotlin("jvm") version "2.3.0"
-    kotlin("plugin.spring") version "2.3.0"
-    id("org.springframework.boot") version "3.5.8"
+    kotlin("jvm") version "2.4.10"
+    kotlin("plugin.spring") version "2.4.10"
+    id("org.springframework.boot") version "4.1.0"
     id("io.spring.dependency-management") version "1.1.7"
 }
 
@@ -10,6 +10,6 @@ kotlin {
 }
 
 dependencies {
-    implementation(platform("org.springframework.ai:spring-ai-bom:1.1.2"))
+    implementation(platform("org.springframework.ai:spring-ai-bom:2.0.0"))
     implementation("org.springframework.ai:spring-ai-starter-model-bedrock-converse")
 }
