@@ -1,4 +1,4 @@
-package com.example.demo
+package com.example.demo.filter
 
 import tools.jackson.core.type.TypeReference
 import tools.jackson.databind.json.JsonMapper

@@ -1,5 +1,6 @@
-package com.example.demo
+package com.example.demo.filter
 
+import com.example.demo.TokenTracker
 import org.slf4j.LoggerFactory
 import org.springframework.ai.chat.client.ChatClient
 import org.springframework.ai.chat.client.ChatClientRequest

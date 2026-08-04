@@ -61,39 +61,37 @@ data class ScenarioResult(
     val main: TokenTracker,
     val overhead: TokenTracker,
     val answer: String?,
+    val durationMs: Long = 0,
 ) {
     val grandTotal: Int get() = main.totalTokens + overhead.totalTokens
 }
 
-/** Prints a side-by-side token comparison. 'vs base' is relative to the plain tool-calling scenario. */
+/** Prints a side-by-side comparison of turns, tokens, and wall-clock time per scenario. */
 fun printComparison(results: List<ScenarioResult>) {
-    val baseline = (results.firstOrNull { it.main.label.contains("plain") } ?: results.first()).grandTotal
     val line = "-".repeat(80)
     println()
     println("=".repeat(80))
-    println("TOKEN USAGE COMPARISON   (outer turns = app chat-client turns incl. all tool-loop")
-    println("                          iterations; inner turns = tool-free filter-derivation calls)")
+    println("TOKEN & TIME COMPARISON   (outer turns = app chat-client turns incl. all tool-loop")
+    println("                           iterations; inner turns = tool-free filter/planning calls)")
     println("=".repeat(80))
     println(
-        "%-24s | %-11s | %-11s | %12s | %-9s".format(
-            "scenario", "outer turns", "inner turns", "total tokens", "vs base",
+        "%-24s | %-11s | %-11s | %12s | %8s".format(
+            "scenario", "outer turns", "inner turns", "total tokens", "time (s)",
         ),
     )
     println(line)
     results.forEach { r ->
-        val delta = if (baseline > 0) 100.0 * (r.grandTotal - baseline) / baseline else 0.0
         println(
-            "%-24s | %11d | %11d | %12d | %+8.1f%%".format(
+            "%-24s | %11d | %11d | %12d | %8.1f".format(
                 r.main.label,
                 r.main.modelCalls,
                 r.overhead.modelCalls,
                 r.grandTotal,
-                delta,
+                r.durationMs / 1000.0,
             ),
         )
     }
     println(line)
-    println("Baseline = plain tool calling ($baseline tokens). Scenario 0 = fixed floor (tools present, no tool call).")
-    println("'total tokens' = outer + inner. Negative 'vs base' = cheaper overall.")
+    println("'total tokens' = outer + inner. Scenario 0 = fixed floor (tools present, no tool call).")
     println("=".repeat(80))
 }
