@@ -108,6 +108,44 @@ class TowlParserTest {
         }
     }
 
+    @Test fun `a binding that fell out of let gets a brace hint`() {
+        // the live failure: "docs" closed one level too high, landing beside "let"
+        val e = assertFailsWith<TowlException> {
+            parser.parse("""{"towl":"v1","description":"x",
+                "let":{"ver":{"source":{"ref":"a"}}},
+                "docs":{"forEach":{"sym":{"from":{"ref":"ver"},"result":1}},"onError":"collect"},
+                "result":{"ref":"docs"}}""")
+        }
+        assertTrue(e.message!!.contains("INSIDE \"let\""), e.message)
+        assertTrue(e.message!!.contains("misplaced closing brace"), e.message)
+    }
+
+    @Test fun `malformed json errors carry a position`() {
+        val e = assertFailsWith<TowlException> {
+            parser.parse("""{"towl":"v1","description":"x",,"result":1}""")
+        }
+        assertTrue(e.message!!.contains("line") || e.message!!.contains("column"), e.message)
+    }
+
+    @Test fun `onError misplaced inside forEach gets a placement hint`() {
+        val e = assertFailsWith<TowlException> {
+            parser.parse("""{"towl":"v1","description":"x",
+                "forEach":{"sym":{"from":{"input":"xs"},"result":1},"onError":"collect"},
+                "inputs":{"xs":{"type":"array","default":[]}}}""")
+        }
+        assertTrue(e.message!!.contains("BESIDE \"forEach\""), e.message)
+        assertTrue(e.message!!.contains("{\"forEach\": {\"sym\": {...}}, \"onError\": ...}"), e.message)
+    }
+
+    @Test fun `body keys misplaced inside forEach get a placement hint`() {
+        val e = assertFailsWith<TowlException> {
+            parser.parse("""{"towl":"v1","description":"x",
+                "forEach":{"sym":{"from":{"input":"xs"},"result":1},"filter":{"present":[{"path":"a"}]}},
+                "inputs":{"xs":{"type":"array","default":[]}}}""")
+        }
+        assertTrue(e.message!!.contains("belongs inside the element body"), e.message)
+    }
+
     @Test fun `the fn-wrapper hallucination gets a corrective diagnostic`() {
         val e = assertFailsWith<TowlException> {
             parser.parse("""{"towl":"v1","description":"x","source":{"ref":"a"},
@@ -434,31 +472,29 @@ class TowlExplainAndSchemaTest {
         assertTrue(text.contains("once per sym"), text)
     }
 
-    @Test fun `planner prompt is generated from registry and the RESOLVED catalog`() {
-        val svc = service()
-        val prompt = svc.plannerSystemPrompt()
-        assertTrue(prompt.contains("\"towl\":\"v1\"") || prompt.contains("\"towl\": \"v1\""))
-        for (fn in listOf("contains", "afterLast")) assertTrue(prompt.contains("$fn("), fn)
-        assertTrue(!prompt.contains("take("), "removed function must not be advertised")
-        assertTrue(prompt.contains("count()"))
-        assertTrue(prompt.contains("closed shapes"))
-        // the TOWL/catalog connection is stated, not implied
-        assertTrue(prompt.contains("How TOWL connects to the operation catalog"))
-        assertTrue(prompt.contains("ALREADY removed"))
-        assertTrue(prompt.contains("may be empty"))
-        // application syntax is stated with the name-as-key rule; no literal-looking "fn" metavariable
-        assertTrue(prompt.contains("the function name IS the single object key"))
-        assertTrue(prompt.contains("never write {\"fn\": [...]}"))
-        assertTrue(prompt.contains("legal ONLY when the plan declares it"))
-        for (op in listOf("get_latest_version", "list_javadoc_symbols", "get_javadoc_symbol"))
-            assertTrue(prompt.contains(op), op)
+    @Test fun `language guide is generated from the registry and carries no catalog`() {
+        val guide = TowlPrompt.languageGuide(TowlRegistry.default())
+        for (fn in listOf("contains", "afterLast")) assertTrue(guide.contains("$fn("), fn)
+        assertTrue(!guide.contains("take("), "removed function must not be advertised")
+        assertTrue(guide.contains("count()"))
+        assertTrue(guide.contains("closed shapes"))
+        assertTrue(guide.contains("How TOWL connects to the operation catalog"))
+        assertTrue(guide.contains("ALREADY removed"))
+        assertTrue(guide.contains("may be empty"))
+        assertTrue(guide.contains("the function name IS the single object key"))
+        assertTrue(guide.contains("never write {\"fn\": [...]}"))
+        assertTrue(guide.contains("BESIDE \"forEach\""))
+        assertTrue(guide.contains("pretty-print") || guide.contains("PRETTY-PRINT") || guide.contains("pretty-printed"))
+        assertTrue(guide.contains("legal ONLY when the plan declares it"))
+        // catalog-free: operations arrive through towlPlanHelper search, not the prompt
+        assertTrue(!guide.contains("list_javadoc_symbols"))
     }
 
     @Test fun `catalog json states stream, value, and text return kinds with unwrapped element schemas`() {
         val svc = service()
         val mapper = tools.jackson.databind.json.JsonMapper.builder().build()
         @Suppress("UNCHECKED_CAST")
-        val entries = mapper.readValue(svc.catalogJson(), List::class.java) as List<Map<String, Any?>>
+        val entries = mapper.readValue(TowlPrompt.catalogJson(FakeCatalog()), List::class.java) as List<Map<String, Any?>>
         val byOp = entries.associateBy { it["operation"] }
 
         val stream = byOp.getValue("list_javadoc_symbols")["returns"] as Map<*, *>

@@ -13,18 +13,17 @@ object TowlPrompt {
 
     private val mapper = JsonMapper.builder().build()
 
+    /** One planner-facing catalog entry derived from a resolved operation, not raw tool JSON. */
+    fun operationEntry(op: ResolvedOperation): Map<String, Any?> = linkedMapOf(
+        "operation" to op.id,
+        "description" to op.description,
+        "args" to op.inputSchema,
+        "returns" to returns(op),
+    )
+
     /** Planner-facing catalog derived from resolved operations, not raw tool JSON. */
-    fun catalogJson(catalog: TowlCatalog): String {
-        val entries = catalog.operations().map { op ->
-            linkedMapOf(
-                "operation" to op.id,
-                "description" to op.description,
-                "args" to op.inputSchema,
-                "returns" to returns(op),
-            )
-        }
-        return mapper.writerWithDefaultPrettyPrinter().writeValueAsString(entries)
-    }
+    fun catalogJson(catalog: TowlCatalog): String =
+        mapper.writerWithDefaultPrettyPrinter().writeValueAsString(catalog.operations().map(::operationEntry))
 
     private fun returns(op: ResolvedOperation): Map<String, Any?> = when {
         op.cardinality == Cardinality.MANY -> {
@@ -45,15 +44,15 @@ object TowlPrompt {
         else -> linkedMapOf("kind" to "value", "schema" to op.outputSchema)
     }
 
-    fun plannerSystem(catalog: TowlCatalog, registry: TowlRegistry): String {
+    /** The TOWL authoring guide: grammar, catalog-connection rules, and vocabulary — no catalog. */
+    fun languageGuide(registry: TowlRegistry): String {
         val functions = registry.functions.values.joinToString("\n") { "    - ${it.description}" }
         val aggregators = registry.aggregators.values.joinToString("\n") { "    - ${it.description}" }
-        val catalogJson = catalogJson(catalog)
         return """
-You are a workflow planner. Given a user task and a catalog of operations, respond with ONLY a
-TOWL v1 JSON document — no prose, no markdown fences.
-
-TOWL is strict JSON. A plan is {"towl":"v1", "description":"...", ...one block}. A block is EXACTLY
+TOWL is strict JSON: one reviewable workflow document, executed deterministically with no model in
+the loop. Emit ONLY the JSON document — no prose, no markdown fences. ALWAYS pretty-print the plan
+with indentation: minified one-line JSON causes the brace-balancing mistakes where a binding falls
+out of "let" and the plan matches no block shape. A plan is {"towl":"v1", "description":"...", ...one block}. A block is EXACTLY
 one of three closed shapes (never mix their keys):
 
   Assemble  {"let": {name: <block>, ...}, "result": <result>}
@@ -66,9 +65,10 @@ one of three closed shapes (never mix their keys):
             Runs the body once per element of "from" (a list). The element is NAMED: reference it
             as {"ref": "<elem>", "path": "..."} inside the body — e.g. in a nested call's args.
             Output is the list of body values; "collect" wraps each as {"ok": ...} or
-            {"error": {"item":..., "code":..., "message":...}}.
+            {"error": {"item":..., "code":..., "message":...}}. "onError" sits BESIDE "forEach"
+            on the block — never inside the forEach object, which holds ONLY the element name.
 
-How TOWL connects to the operation catalog (the JSON at the end):
+How TOWL connects to the operation catalog (the "matched" entries):
 - "operation" in a call MUST be a catalog "operation" name, and "args" keys MUST come from that
   entry's "args" schema; every name in its "required" list must be present. Validation rejects
   unknown operations, unknown arguments, and missing required arguments — never invent either.
@@ -139,8 +139,6 @@ whole string is {"path": ""}):
   "result": {"ref": "docs"}
 }
 
-Operation catalog (JSON):
-$catalogJson
 """.trim()
     }
 }

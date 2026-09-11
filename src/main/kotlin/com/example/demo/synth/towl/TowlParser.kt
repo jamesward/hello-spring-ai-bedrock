@@ -13,9 +13,13 @@ class TowlParser(private val registry: TowlRegistry) {
 
     private val mapper = JsonMapper.builder()
         .enable(StreamReadFeature.STRICT_DUPLICATE_DETECTION)
+        .enable(StreamReadFeature.INCLUDE_SOURCE_IN_LOCATION)
         .build()
 
     private val namePattern = Regex("[A-Za-z_][A-Za-z0-9_]*")
+
+    /** Known structural keys, used to give placement hints when they appear in the wrong object. */
+    private val STRUCTURAL_KEYS = setOf("onError", "filter", "dedup", "result", "let", "source", "from", "forEach")
 
     fun parse(text: String): Plan {
         val preprocessing = mutableListOf<String>()
@@ -65,14 +69,36 @@ class TowlParser(private val registry: TowlRegistry) {
 
     private fun closed(raw: Map<String, Any?>, allowed: Set<String>, variant: String, where: String) {
         val foreign = raw.keys - allowed
-        if (foreign.isNotEmpty())
-            fail(where, "$variant block admits only $allowed; foreign members $foreign match no block shape")
+        if (foreign.isEmpty()) return
+        val bindingLike = foreign.filter { k ->
+            (raw[k] as? Map<*, *>)?.keys?.any { it in setOf("forEach", "source", "call", "let", "result") } == true
+        }
+        val hint = if (bindingLike.isEmpty()) "" else
+            " — $bindingLike look(s) like bindings; every binding lives INSIDE \"let\": " +
+                "{\"let\": {\"${bindingLike.first()}\": {...}, ...}, \"result\": ...}. This is usually a " +
+                "misplaced closing brace: the member ended up beside \"let\" instead of inside it. " +
+                "Re-emit the plan pretty-printed and re-check the nesting."
+        fail(where, "$variant block admits only $allowed; foreign members $foreign match no block shape$hint")
     }
 
     private fun parseTraverse(raw: Map<String, Any?>, where: String): Traverse {
         closed(raw, setOf("forEach", "onError"), "Traverse", where)
         val fe = raw["forEach"] as? Map<*, *> ?: fail(where, "\"forEach\" must be an object")
-        if (fe.size != 1) fail(where, "\"forEach\" declares exactly one element variable (Map1); found ${fe.keys}")
+        if (fe.size != 1) {
+            val keys = fe.keys.map { it.toString() }
+            val misplaced = keys.filter { it in STRUCTURAL_KEYS }
+            val elems = keys - misplaced.toSet()
+            if (elems.size == 1 && misplaced.isNotEmpty()) {
+                val hints = misplaced.joinToString("; ") { k ->
+                    if (k == "onError")
+                        "\"onError\" belongs on the Traverse block BESIDE \"forEach\": {\"forEach\": {\"${elems.first()}\": {...}}, \"onError\": ...}"
+                    else
+                        "\"$k\" belongs inside the element body: {\"${elems.first()}\": {\"from\": ..., \"$k\": ...}}"
+                }
+                fail(where, "\"forEach\" declares exactly one element variable; found $keys — $hints")
+            }
+            fail(where, "\"forEach\" declares exactly one element variable (Map1); found $keys")
+        }
         val (k, v) = fe.entries.first()
         val name = binderName(k, "$where.forEach")
         val elem = v as? Map<*, *> ?: fail("$where.forEach.$name", "element must be an object with \"from\" plus one block shape")

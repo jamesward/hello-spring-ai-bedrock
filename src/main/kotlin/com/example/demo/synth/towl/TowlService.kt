@@ -7,8 +7,8 @@ import tools.jackson.databind.json.JsonMapper
  * or persisted; run always revalidates from source.
  */
 class TowlService(
-    private val catalog: TowlCatalog,
-    private val registry: TowlRegistry = TowlRegistry.default(),
+    val catalog: TowlCatalog,
+    val registry: TowlRegistry = TowlRegistry.default(),
     env: Map<String, Any?> = emptyMap(),
     maxConcurrency: Int = 6,
 ) {
@@ -17,10 +17,6 @@ class TowlService(
     private val explainer = TowlExplainer()
     private val interpreter = TowlInterpreter(registry, env, maxConcurrency)
     private val mapper = JsonMapper.builder().build()
-
-    fun plannerSystemPrompt(): String = TowlPrompt.plannerSystem(catalog, registry)
-
-    fun catalogJson(): String = TowlPrompt.catalogJson(catalog)
 
     fun parse(text: String): Plan = parser.parse(text)
 

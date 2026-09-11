@@ -5,6 +5,7 @@ import com.example.demo.report
 import com.example.demo.runScenario
 import com.example.demo.synth.towl.McpTowlCatalog
 import com.example.demo.synth.towl.TowlService
+import com.example.demo.synth.towl.TowlTools
 import io.modelcontextprotocol.client.McpSyncClient
 import org.springframework.ai.chat.client.ChatClient
 import org.springframework.boot.CommandLineRunner
@@ -14,9 +15,10 @@ import org.springframework.context.annotation.Bean
 import org.springframework.context.annotation.Import
 
 /**
- * Group B — synthetic tool system. B2 plans ONE TOWL document, statically validates and explains
- * it, runs it against the real MCP tools with runtime-owned parallelism (no LLM in the loop),
- * then summarizes the single compact result.
+ * Group B — synthetic tool system. B1 is plain multi-turn tool calling over the raw MCP tools.
+ * B2 REPLACES those tools with the three TOWL tools (towlPlanHelper / validateTowlPlan /
+ * runTowlPlan): the agent searches the catalog, authors one TOWL plan, and executes it with no
+ * model in the data loop.
  */
 @SpringBootApplication
 @Import(AppConfig::class)
@@ -31,22 +33,25 @@ class SynthApp {
     fun towlService(mcpToolCatalog: McpToolCatalog): TowlService =
         TowlService(McpTowlCatalog(mcpToolCatalog))
 
+    /** TOWL as an agent tool belt; for B2 these REPLACE the raw MCP tools. */
+    @Bean
+    fun towlTools(towlService: TowlService): TowlTools = TowlTools(towlService)
+
     @Bean
     fun synthRunner(
         chatClient: ChatClient,
-        secondaryChatClient: ChatClient,
-        towlService: TowlService,
+        agentClientBuilder: ChatClient.Builder,
+        towlTools: TowlTools,
     ) = CommandLineRunner {
         val summarizePrompt = """
             summarize the classes in the latest jackson-databind library that are related to polymorphic type validation
         """.trimIndent()
 
         val b1 = runScenario("B1. plain multi-turn", chatClient, summarizePrompt) { emptyList() }
-
-        println(towlService.plannerSystemPrompt())
-        val b2 = runSynthetic("B2. synthetic (TOWL)", secondaryChatClient, towlService, summarizePrompt)
+        val b2 = runSynthetic("B2. synthetic (TOWL tools)", agentClientBuilder, towlTools, summarizePrompt)
 
         report("GROUP B - SYNTHETIC TOOL SYSTEM (multi-turn)", listOf(b1, b2))
+//        report("GROUP B - SYNTHETIC TOOL SYSTEM (multi-turn)", listOf(b2))
     }
 }
 

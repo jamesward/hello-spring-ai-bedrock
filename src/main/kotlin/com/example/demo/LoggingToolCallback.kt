@@ -48,7 +48,7 @@ class LoggingToolCallback(private val delegate: ToolCallback) : ToolCallback {
     }
 
     companion object {
-        private const val MAX_LOG_CHARS = 300
+        private const val MAX_LOG_CHARS = 30000
 
         /** Wraps every tool of [provider] in a [LoggingToolCallback]. */
         fun wrap(provider: ToolCallbackProvider): ToolCallbackProvider =
