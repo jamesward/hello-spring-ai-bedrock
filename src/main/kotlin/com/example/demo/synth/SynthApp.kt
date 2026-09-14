@@ -3,6 +3,8 @@ package com.example.demo.synth
 import com.example.demo.AppConfig
 import com.example.demo.report
 import com.example.demo.runScenario
+import com.example.demo.synth.towl.CompositeCatalog
+import com.example.demo.synth.towl.LlmCatalog
 import com.example.demo.synth.towl.McpTowlCatalog
 import com.example.demo.synth.towl.TowlService
 import com.example.demo.synth.towl.TowlTools
@@ -16,9 +18,9 @@ import org.springframework.context.annotation.Import
 
 /**
  * Group B — synthetic tool system. B1 is plain multi-turn tool calling over the raw MCP tools.
- * B2 REPLACES those tools with the three TOWL tools (towlPlanHelper / validateTowlPlan /
- * runTowlPlan): the agent searches the catalog, authors one TOWL plan, and executes it with no
- * model in the data loop.
+ * B2 REPLACES those tools with the three TOWL v3 tools (towlPlanHelper / validateTowlPlan /
+ * runTowlPlan): the agent searches the catalog, authors one TOWL program as text, and executes it
+ * with no model in the data loop (except where the program itself calls llm.summarize).
  */
 @SpringBootApplication
 @Import(AppConfig::class)
@@ -28,10 +30,17 @@ class SynthApp {
     @Bean
     fun mcpToolCatalog(mcpSyncClients: List<McpSyncClient>): McpToolCatalog = McpToolCatalog(mcpSyncClients)
 
-    /** The TOWL phase pipeline (parse/validate/explain/run) over the MCP-backed operation catalog. */
+    /**
+     * The TOWL v3 pipeline (parse/check/render/run) over the MCP-backed catalog plus the `llm`
+     * namespace (`llm.summarize`), so summarizing a document is an explicit step in the program.
+     */
     @Bean
-    fun towlService(mcpToolCatalog: McpToolCatalog): TowlService =
-        TowlService(McpTowlCatalog(mcpToolCatalog))
+    fun towlService(mcpToolCatalog: McpToolCatalog, secondaryChatClient: ChatClient): TowlService =
+        TowlService(CompositeCatalog(listOf(
+            McpTowlCatalog(mcpToolCatalog),
+            // tool-free client; each summarize call is recorded on the running scenario's inner tracker
+            LlmCatalog(secondaryChatClient, tracker = { InnerModelCalls.tracker.get() }),
+        )))
 
     /** TOWL as an agent tool belt; for B2 these REPLACE the raw MCP tools. */
     @Bean

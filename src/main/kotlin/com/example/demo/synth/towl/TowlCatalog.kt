@@ -5,99 +5,105 @@ import io.modelcontextprotocol.spec.McpSchema
 import tools.jackson.databind.json.JsonMapper
 
 /**
- * The operation-catalog contract TOWL is parameterized by. The interpreter executes only through
- * [ResolvedOperation.invoke]; a fake catalog makes every phase unit-testable without MCP.
+ * The catalog contract TOWL v3 is parameterized by (TOWL_SPEC.md §10). The runtime executes only
+ * through [OperationSpec.invoke]; a fake catalog makes every phase unit-testable without MCP.
  */
 
-enum class Cardinality { ONE, OPTIONAL, MANY }
+enum class Effect { READ, MUTATE, UNKNOWN }
 
-sealed interface ResolveOutcome
-data class Resolved(val op: ResolvedOperation) : ResolveOutcome
-data class Unknown(val didYouMean: List<String>) : ResolveOutcome
-data class Ambiguous(val qualifiers: List<String>) : ResolveOutcome
+enum class ErrorClass { TRANSIENT, VALIDATION, AUTHORIZATION, AVAILABILITY, ABSENCE, STATE, OTHER }
 
-class ResolvedOperation(
-    val id: String,
+/** Thrown by invokers; `code` is what `tolerate` matches against. */
+class OperationError(val code: String, message: String, cause: Throwable? = null) : RuntimeException(message, cause)
+
+class OperationSpec(
+    val namespace: String,
+    val name: String,
     val description: String?,
-    val inputSchema: Map<String, Any?>?,
-    val outputSchema: Map<String, Any?>?,
-    /** MANY streams are exposed as the JSON list at [subjectPath] of the raw output. */
-    val cardinality: Cardinality,
-    val subjectPath: Path?,
-    val effects: Set<String>, // e.g. "read", "mutate", "unknown"
-    val paged: Boolean, // MCP tools do not page; paginate is capability-gated on this
+    /** Input record type; `null` means the operation declares no input schema (any record). */
+    val input: TRecord?,
+    val output: Type,
+    val effect: Effect,
+    val errorCodes: Set<String> = emptySet(),
+    val openErrorCodes: Boolean = true,
     private val invoker: (Map<String, Any?>) -> Any?,
 ) {
+    val id get() = "$namespace.$name"
     fun invoke(args: Map<String, Any?>): Any? = invoker(args)
-
-    /** Required property names from the declared JSON Schema, for validation. */
-    fun requiredArgs(): Set<String> =
-        ((inputSchema?.get("required") as? List<*>)?.filterIsInstance<String>() ?: emptyList()).toSet()
-
-    fun declaredArgs(): Set<String>? =
-        (inputSchema?.get("properties") as? Map<*, *>)?.keys?.filterIsInstance<String>()?.toSet()
 }
 
 interface TowlCatalog {
-    val name: String
-    fun resolve(service: String?, operation: String): ResolveOutcome
-    fun operations(): List<ResolvedOperation>
+    val namespaces: Set<String>
+    fun operation(namespace: String, name: String): OperationSpec?
+    fun operations(): List<OperationSpec>
+
+    /** Deterministic classification of a provider error code (TOWL §12.4). */
+    fun errorClass(op: OperationSpec, code: String): ErrorClass = defaultErrorClass(code)
+
+    companion object {
+        fun defaultErrorClass(code: String): ErrorClass {
+            val c = code.lowercase()
+            return when {
+                c.contains("throttl") || c.contains("timeout") || c.contains("toomany") || c.contains("unavailable") -> ErrorClass.TRANSIENT
+                c.contains("validation") || c.contains("invalidparam") || c.contains("invalid_param") || c.contains("malformed") -> ErrorClass.VALIDATION
+                c.contains("accessdenied") || c.contains("unauthorized") || c.contains("forbidden") || c.contains("authfailure") -> ErrorClass.AUTHORIZATION
+                c.contains("optin") || c.contains("unsupported") -> ErrorClass.AVAILABILITY
+                c.contains("notfound") || c.contains("nosuch") || c.contains("not_found") || c.contains("noresult") -> ErrorClass.ABSENCE
+                c.contains("state") || c.contains("inuse") || c.contains("conflict") || c.contains("dependency") -> ErrorClass.STATE
+                else -> ErrorClass.OTHER
+            }
+        }
+    }
 }
 
 /**
- * Adapts the startup [McpToolCatalog] to the TOWL catalog contract. MCP carries no service
- * qualifier, so operations resolve unqualified; a supplied qualifier must match the catalog name.
- *
- * Cardinality: an MCP tool result is One<document> unless its output schema designates a subject —
- * here, a single top-level array property (e.g. list_javadoc_symbols -> {result: [...]}) is treated
- * as the record stream. A list member alone never implies MANY; this rule is this catalog's
- * explicit metadata decision.
+ * Adapts the startup [McpToolCatalog] to the TOWL v3 catalog: one namespace per MCP server
+ * (sanitized server name; `tools` when unavailable), JSON Schema mapped to TOWL types by
+ * [Types.fromJsonSchema], `readOnlyHint` -> READ, no annotations -> UNKNOWN (treated as mutate),
+ * text-only results -> `string`, structured results -> the output type.
  */
 class McpTowlCatalog(private val mcp: McpToolCatalog) : TowlCatalog {
     private val mapper = JsonMapper.builder().build()
-    override val name = "mcp"
 
-    private val ops: Map<String, ResolvedOperation> = mcp.tools.associate { t ->
-        val subject = singleArrayProperty(t.outputSchema)
-        t.name to ResolvedOperation(
-            id = t.name,
+    private val ops: Map<String, OperationSpec> = mcp.tools.associate { t ->
+        val ns = namespaceOf(t)
+        val outputType = if (t.outputSchema.isNullOrEmpty()) TString else Types.fromJsonSchema(t.outputSchema)
+        val inputType = t.inputSchema?.let { Types.fromJsonSchema(it) as? TRecord }
+        val readOnly = runCatching { mcp.annotations(t.name)?.readOnlyHint() }.getOrNull()
+        "$ns.${t.name}" to OperationSpec(
+            namespace = ns,
+            name = t.name,
             description = t.description,
-            inputSchema = t.inputSchema,
-            outputSchema = t.outputSchema,
-            cardinality = if (subject != null) Cardinality.MANY else Cardinality.ONE,
-            subjectPath = subject?.let { Path.parse("$it[]", "catalog:${t.name}") },
-            effects = setOf("unknown"),
-            paged = false,
-            invoker = { args -> call(t.name, args) },
+            input = inputType,
+            output = outputType,
+            effect = if (readOnly == true) Effect.READ else Effect.UNKNOWN,
+            invoker = { args -> call(t.name, args, outputType) },
         )
     }
 
-    override fun resolve(service: String?, operation: String): ResolveOutcome {
-        if (service != null && service != name) return Unknown(listOf("omit service or use '$name'"))
-        val op = ops[operation] ?: return Unknown(nearest(operation))
-        return Resolved(op)
+    override val namespaces: Set<String> = ops.values.map { it.namespace }.toSet()
+    override fun operation(namespace: String, name: String) = ops["$namespace.$name"]
+    override fun operations(): List<OperationSpec> = ops.values.toList()
+
+    private fun namespaceOf(t: McpToolCatalog.ToolInfo): String {
+        val raw = runCatching { t.client.serverInfo?.name() }.getOrNull() ?: "tools"
+        val cleaned = raw.lowercase().replace(Regex("[^a-z0-9_]+"), "_").trim('_')
+        return if (cleaned.isEmpty() || !cleaned[0].isLetter()) "tools" else cleaned
     }
 
-    override fun operations(): List<ResolvedOperation> = ops.values.toList()
-
-    private fun nearest(operation: String): List<String> =
-        ops.keys.filter { it.contains(operation.take(4), ignoreCase = true) }.take(3)
-
-    private fun singleArrayProperty(outputSchema: Map<String, Any?>?): String? {
-        val props = outputSchema?.get("properties") as? Map<*, *> ?: return null
-        if (props.size != 1) return null
-        val (k, v) = props.entries.first()
-        val type = (v as? Map<*, *>)?.get("type")
-        return if (type == "array") k as? String else null
-    }
-
-    private fun call(tool: String, args: Map<String, Any?>): Any? {
+    private fun call(tool: String, args: Map<String, Any?>, output: Type): Any? {
         val client = mcp.client(tool)
         val req = McpSchema.CallToolRequest.builder().name(tool).arguments(args).build()
         val res = client.callTool(req)
-        val text = res.content()
-            .filterIsInstance<McpSchema.TextContent>()
-            .joinToString("") { it.text() }
-        return runCatching { mapper.readValue(text, Any::class.java) }.getOrElse { text }
+        val text = res.content().filterIsInstance<McpSchema.TextContent>().joinToString("") { it.text() }
+        if (res.isError() == true) throw OperationError(errorCodeOf(text), text.ifBlank { "tool '$tool' reported an error" })
+        if (output == TString) return text
+        val structured = res.structuredContent()
+        val value = structured ?: runCatching { mapper.readValue(text, Any::class.java) }.getOrElse { text }
+        return Types.normalize(value, output)
     }
+
+    /** MCP carries no error code; take a leading `Code:` or `[Code]` token when present, else "ToolError". */
+    private fun errorCodeOf(text: String): String =
+        Regex("""^\s*\[?([A-Za-z][A-Za-z0-9_.]*)]?\s*:""").find(text)?.groupValues?.get(1) ?: "ToolError"
 }

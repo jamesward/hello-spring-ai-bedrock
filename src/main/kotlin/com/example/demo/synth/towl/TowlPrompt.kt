@@ -1,144 +1,116 @@
 package com.example.demo.synth.towl
 
-import tools.jackson.databind.json.JsonMapper
-
 /**
- * The schema phase: everything a planner needs to author valid TOWL, generated from the live
- * registry and the RESOLVED catalog — the same objects validation and execution use — rather
- * than raw transport schemas. Each catalog entry states how sourcing it behaves in TOWL:
- * "stream" (elements of `returns.element`, wrapper already removed), "value" (one structured
- * value), or "text" (one plain string).
+ * The schema phase: everything a planner needs to author valid TOWL v3, generated from the RESOLVED
+ * catalog — the same objects the checker and runtime use — rather than raw transport schemas.
  */
 object TowlPrompt {
 
-    private val mapper = JsonMapper.builder().build()
+    /** An operation that reduces text, if this catalog has one (e.g. llm.summarize); never assumed. */
+    fun summarizer(catalog: TowlCatalog): OperationSpec? =
+        catalog.operations().firstOrNull { it.name.contains("summar", ignoreCase = true) && it.output == TString }
 
-    /** One planner-facing catalog entry derived from a resolved operation, not raw tool JSON. */
-    fun operationEntry(op: ResolvedOperation): Map<String, Any?> = linkedMapOf(
+    /** One planner-facing catalog entry: exact parameter and result types in TOWL type syntax. */
+    fun operationEntry(op: OperationSpec, catalog: TowlCatalog): Map<String, Any?> = linkedMapOf(
         "operation" to op.id,
         "description" to op.description,
-        "args" to op.inputSchema,
-        "returns" to returns(op),
+        "params" to (op.input?.toString() ?: "{ } (no declared parameters)"),
+        "returns" to returns(op.output),
+        "effect" to op.effect.name.lowercase(),
+        "note" to when (Types.stripNull(op.output)) {
+            TString -> "the call's value IS the text (often long) — there is no wrapper member such as .result" +
+                (summarizer(catalog)?.let { s -> if (s.id != op.id) "; pass the value to ${s.id} if the task needs a digest" else "" }
+                    ?: "; this catalog has no operation that shortens text, so keep the number of documents small")
+            TJson -> "the call's value is untyped json; use it whole, no member access"
+            is TRecord -> "access members of the returned record, e.g. .${(Types.stripNull(op.output) as TRecord).fields.keys.first()}"
+            else -> null
+        },
     )
 
-    /** Planner-facing catalog derived from resolved operations, not raw tool JSON. */
-    fun catalogJson(catalog: TowlCatalog): String =
-        mapper.writerWithDefaultPrettyPrinter().writeValueAsString(catalog.operations().map(::operationEntry))
-
-    private fun returns(op: ResolvedOperation): Map<String, Any?> = when {
-        op.cardinality == Cardinality.MANY -> {
-            val subject = op.subjectPath!!.segments.first().name
-            val props = op.outputSchema?.get("properties") as? Map<*, *>
-            val element = (props?.get(subject) as? Map<*, *>)?.get("items")
-            linkedMapOf(
-                "kind" to "stream",
-                "element" to element,
-                "note" to "sourcing this streams one element at a time; a bare {\"path\": ...} reads " +
-                    "fields of returns.element — the '$subject' wrapper is ALREADY removed, never mention it",
-            )
-        }
-        op.outputSchema == null -> linkedMapOf(
-            "kind" to "text",
-            "note" to "one plain text string (often long); {\"path\": \"\"} is the string itself",
-        )
-        else -> linkedMapOf("kind" to "value", "schema" to op.outputSchema)
+    /** Scalar results are spelled out so a model does not assume a record wrapper it saw on other tools. */
+    private fun returns(t: Type): String = when (Types.stripNull(t)) {
+        TString, TInt, TNumber, TBool, TTimestamp, TJson -> "$t  (a bare value, not a record)"
+        else -> t.toString()
     }
 
-    /** The TOWL authoring guide: grammar, catalog-connection rules, and vocabulary — no catalog. */
-    fun languageGuide(registry: TowlRegistry): String {
-        val functions = registry.functions.values.joinToString("\n") { "    - ${it.description}" }
-        val aggregators = registry.aggregators.values.joinToString("\n") { "    - ${it.description}" }
+    /** The TOWL v3 authoring guide: grammar, stdlib with types, rules, and one example. Generated from the catalog: it never names an operation the catalog lacks. */
+    fun languageGuide(catalog: TowlCatalog): String {
+        val sum = summarizer(catalog)
+        val shortenRule = if (sum != null)
+            "- Keep the result SMALL: project only the fields the answer needs. There is no truncation; to\n  shorten long text, call ${sum.id} on it (an ordinary, reported operation)."
+        else
+            "- Keep the result SMALL: project only the fields the answer needs. There is no truncation and this\n  catalog has no operation that shortens text: narrow with where(...) and return only what is asked."
+        val exampleSum = if (sum != null) """,
+        { "name": "sum", "call": "${sum.id}", "params": { "text": {"${'$'}": "doc"} } }""" else ""
+        val exampleResult = if (sum != null) "{ class: s.fqn.after_last(\\\".\\\"), summary: sum }" else "{ class: s.fqn.after_last(\\\".\\\"), doc: doc }"
         return """
-TOWL is strict JSON: one reviewable workflow document, executed deterministically with no model in
-the loop. Emit ONLY the JSON document — no prose, no markdown fences. ALWAYS pretty-print the plan
-with indentation: minified one-line JSON causes the brace-balancing mistakes where a binding falls
-out of "let" and the plan matches no block shape. A plan is {"towl":"v1", "description":"...", ...one block}. A block is EXACTLY
-one of three closed shapes (never mix their keys):
+TOWL v3 is a small typed expression language for one workflow of catalog operations plus pure
+transforms. You write ONE program; it is type-checked before anything runs and then executed with no
+model in the loop.
 
-  Assemble  {"let": {name: <block>, ...}, "result": <result>}
-            Binds values; each let value is itself a block. "result" shapes the plan/block value;
-            without it the single unconsumed binding is the value.
-  Express   {"source": <producer>, "filter": <boolExpr>?, "dedup": [<expr>,...]?, "result": <result>?, "onError": "fail"|"skip"?}
-            "source" is {"call": {"operation": "<op>", "args": {...}}} or an expression such as
-            {"ref": "name"} referencing an earlier binding whose value is a list.
-  Traverse  {"forEach": {"<elem>": {"from": <expr>, ...body block}}, "onError": "fail"|"skip"|"collect"?}
-            Runs the body once per element of "from" (a list). The element is NAMED: reference it
-            as {"ref": "<elem>", "path": "..."} inside the body — e.g. in a nested call's args.
-            Output is the list of body values; "collect" wraps each as {"ok": ...} or
-            {"error": {"item":..., "code":..., "message":...}}. "onError" sits BESIDE "forEach"
-            on the block — never inside the forEach object, which holds ONLY the element name.
+PROGRAM (pass it to the tools as this structured object)
+  { "towl": 3, "description": "what this does",
+    "inputs":   { "name": "type" },              # optional; values the host supplies (list[string], { a: string })
+    "bindings": [ <binding>, ... ],              # ordered; each name bound once; every binding must feed the result
+    "result":   "expr" }                         # one result expression (text) — its value is the answer
+  A <binding> is exactly one of:
+    { "name": "x", "value": "expr" }                                   # any TOWL expression in text
+    { "name": "x", "call": "ns.op", "params": { ...JSON... },           # an operation call; params is a real JSON object:
+      "options": { "tolerate": ["Code"], "after": ["y"] }, "then": ".result.where(...)" }   #   literal data as-is, references as {"$": "ver"} or {"$": "s.link"}
+    { "name": "x", "each": { "over": "list expr", "as": "s", "bindings": [ <binding>, ... ], "result": "expr" } }   # fan-out with per-element calls
 
-How TOWL connects to the operation catalog (the "matched" entries):
-- "operation" in a call MUST be a catalog "operation" name, and "args" keys MUST come from that
-  entry's "args" schema; every name in its "required" list must be present. Validation rejects
-  unknown operations, unknown arguments, and missing required arguments — never invent either.
-- Each entry's "returns" says exactly what sourcing it produces in TOWL:
-  - kind "stream": the source streams ELEMENTS shaped like returns.element. Inside that block's
-    filter/dedup/result the current element is IMPLICIT: {"path": "fqn"} reads a field of ONE
-    element. Any transport wrapper (such as a top-level "result" member) is ALREADY removed —
-    never write it in a path. The binding's value is the list of surviving elements: use it as
-    "from" in a Traverse, or fold it with aggregate result leaves.
-  - kind "value": ONE structured value. "filter", "dedup", and aggregate results are ILLEGAL on
-    it; an optional "result" maps it once, with bare paths reading its schema's fields.
-  - kind "text": ONE plain string. {"path": ""} is the whole string; always bound it with take.
-- Data flows only by reference: an output field feeds a later input as
-  {"ref": "<binding or elem>", "path": "<field>"}. There are no string templates.
+VALUES: "str"  12  1.5  true  null  [a, b]  { key: value }
+CALLS (the ONLY effects): namespace.operation({ Param: value, ... })
+  Parameters are a record checked against the operation's params type. A second argument holds
+  options: namespace.operation({...}, { tolerate: ["SomeErrorCode"] }) makes that error yield null
+  instead of stopping the program; { after: otherBinding } orders two calls that share no data.
+  Calls may NOT appear inside paths, shapes, predicates, or another call's parameters: bind them.
+MEMBERS: x.Field   x?.Field (when x may be null)   x.or(default)  (replaces null)
+FAN-OUT (the only binder): list.each(x => body)   -> list[body type]; bodies may call operations.
+  A body with several steps is a block: list.each(x => { a = ...  b = ...  { out: a, n: b } })
+LIST FUNCTIONS take a PATH from the element (.Field.Sub) or a PREDICATE, never a function:
+  .project(.Field) -> list[T]        .project({ name: .Field, n: .Items.count() }) -> list[record]
+  .flat(.Items)    -> list[T]        flattens one list-typed member per element (use this, not project, for a flat list)
+  .flatten()       -> list[T]        list[list[T]] -> list[T]
+  .where(pred)     -> list[T]        pred: .A == "x"  .A != 1  .A < 5  .A in ["x","y"]  .A.present()  .A.absent()
+                                      .A.contains("s") .A.starts_with("s") .A.ends_with("s")  .L.any(pred)  .L.all(pred)
+                                      combined with && || ! ( )
+  .compact()       -> list[T]        drops nulls        .distinct() / .distinct(.Key)      .concat(otherList)
+  .group(.Key)     -> list[{ key, items }]              .single() -> T | Null  (0 -> null, 2+ -> error)
+AGGREGATES: .count() -> int   .sum(.N) .avg(.N)   .min(.N) .max(.N)   .collect(.Field) -> list   .any(pred) .all(pred)
+STRINGS: s.after_last(".")  s.before_first("/")  s.lower()  s.upper()
+TYPES you will see: string int number bool timestamp json list[T] { field: T } and T | Null (may be absent).
+  A member typed T | Null must go through ?. or .or(...) before use. json is opaque: use it whole.
 
-Expressions (typed applications; unknown names are rejected, never guessed):
-  {"ref": "name", "path": "a.b"}   earlier binding or forEach element (path optional)
-  {"path": "a.b"}                  the implicit source element (Express filter/dedup/result only)
-  {"input": "name"}                a plan input; legal ONLY when the plan declares it in a top-level
-                                   "inputs": {"name": {"type": "string", "default": ...}} member.
-                                   When the task states concrete values, write them as literals.
-  {"<functionName>": [arg1, ...]}  function application: the function name IS the single object key,
-                                   e.g. {"contains": [{"path": "fqn"}, "Cache"]} or
-                                   {"or": [{"contains": [...]}, {"contains": [...]}]}.
-                                   There is NO wrapper key: never write {"fn": [...]} and never put
-                                   the function name inside the argument array.
-                                   Available functions:
-$functions
+RULES
+- Read each operation's "returns" type: if it is a record, access its members (.result, .items);
+  if it is a bare string/json, the call's value IS the result — never invent a wrapper member.
+- Search the catalog by what an operation DOES; task subjects (names, ids) are parameter values.
+- Filter before you fan out; fan out (each) only when each element needs its own operation call.
+- Any runtime error stops the program and you get a report of what completed; fix the program and
+  run again, or declare tolerate for an error code the report showed. Do not guess error codes.
+$shortenRule
+- Only operations listed by the helper exist. If a capability you searched for is reported as
+  unmatched, it does not exist in this catalog: do not search again; design the program without it.
+- Order of list elements is not meaningful; there are no first/take/sort functions.
 
-Aggregators (legal only as result leaves in an Express block over a stream; any aggregate leaf
-folds the whole stream to one value, and pure leaves beside it must not read the element):
-$aggregators
+EXAMPLE (structure only — use real operation names and parameters from the catalog)
+{ "towl": 3, "description": "classes about validation, with a digest of each",
+  "bindings": [
+    { "name": "ver",  "call": "docs.get_latest_version", "params": { "groupId": "g", "artifactId": "a" }, "then": ".result" },
+    { "name": "syms", "call": "docs.list_symbols", "params": { "groupId": "g", "artifactId": "a", "version": {"$": "ver"} },
+      "then": ".result.where(.fqn.contains(\"Validator\"))" },
+    { "name": "digests", "each": { "over": "syms", "as": "s",
+      "bindings": [
+        { "name": "doc", "call": "docs.get_doc", "params": { "groupId": "g", "artifactId": "a", "version": {"$": "ver"}, "link": {"$": "s.link"} } }$exampleSum
+      ],
+      "result": "$exampleResult" } }
+  ],
+  "result": "digests" }
+Never write a reference as a plain string in params ("version": "ver" is the LITERAL text ver); use {"$": "ver"}.
+(docs.* above are placeholders; the only real namespaces are listed next.)
 
-Paths are member navigation only: "a.b", one flatten "items[].name". No indexes, no expressions in
-paths.
-
-Rules:
-- Filter BEFORE you traverse; fan out with Traverse only for per-element operation calls.
-- Filters must be ROBUST: if a schema field's description says it may be empty or optional, never
-  demand it with eq() — an over-strict filter silently yields an empty result. Match on the
-  identifying string fields (like fqn or name) with contains instead, and add conjuncts only when
-  the task requires them.
-- Make the final "result" as SMALL as possible: project just the fields needed to answer the task
-  (e.g. afterLast(fqn, ".") for class names) and keep traversals narrow. Never include whole documents.
-
-Example shape (structure only — use the real operation and argument names from the catalog; here
-list_symbols returns kind "stream" with element {fqn, link}, get_doc returns kind "text" and its
-whole string is {"path": ""}):
-{
-  "towl": "v1",
-  "description": "inspect matching items",
-  "let": {
-    "ver": {"source": {"call": {"operation": "get_latest_version", "args": {"g": "x", "a": "y"}}}},
-    "syms": {
-      "source": {"call": {"operation": "list_symbols", "args": {"version": {"ref": "ver", "path": "result"}}}},
-      "filter": {"contains": [{"path": "fqn"}, "Cache"]}
-    },
-    "docs": {
-      "forEach": {"sym": {
-        "from": {"ref": "syms"},
-        "source": {"call": {"operation": "get_doc", "args": {"link": {"ref": "sym", "path": "link"}}}},
-        "result": {"class": {"afterLast": [{"ref": "sym", "path": "fqn"}, "."]},
-                   "doc": {"path": ""}}
-      }},
-      "onError": "collect"
-    }
-  },
-  "result": {"ref": "docs"}
-}
-
+Namespaces in this catalog: ${catalog.namespaces.sorted().joinToString(", ")}
 """.trim()
     }
 }

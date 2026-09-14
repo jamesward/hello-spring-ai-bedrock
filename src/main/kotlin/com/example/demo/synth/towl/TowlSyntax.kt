@@ -1,0 +1,404 @@
+package com.example.demo.synth.towl
+
+/**
+ * TOWL v3 surface syntax (TOWL_SPEC.md §§2–3): lexer, AST, and a recursive-descent parser.
+ *
+ * The parser knows the catalog's namespace set so that `ns.op(...)` is recognized as the only
+ * effectful form at parse time; everything else about legality (pure layer, argument kinds,
+ * types) is the checker's job, so that one pass can report every problem.
+ */
+
+data class Pos(val line: Int, val col: Int) {
+    override fun toString() = "$line:$col"
+}
+
+data class Diagnostic(
+    val severity: String, // "error" | "warning"
+    val phase: String, // syntax | names | catalog | types | effects | input
+    val code: String,
+    val pos: Pos?,
+    val message: String,
+    val fix: String? = null,
+    val type: String? = null,
+) {
+    fun toMap(): Map<String, Any?> = linkedMapOf(
+        "severity" to severity, "phase" to phase, "code" to code,
+        "line" to pos?.line, "col" to pos?.col, "message" to message, "fix" to fix, "type" to type,
+    )
+
+    override fun toString() = "$severity[$code] ${pos ?: "-"}: $message" + (fix?.let { " (fix: $it)" } ?: "")
+}
+
+class TowlException(val diagnostics: List<Diagnostic>) :
+    RuntimeException(diagnostics.joinToString("; ") { it.toString() })
+
+// ── AST ──────────────────────────────────────────────────────────────────────
+
+sealed interface Expr { val pos: Pos }
+data class Lit(val value: Any?, override val pos: Pos) : Expr
+data class Ref(val name: String, override val pos: Pos) : Expr
+/** The implicit element of an Express function; root of every `.a.b` path. */
+data class Implicit(override val pos: Pos) : Expr
+data class RecordE(val fields: List<Pair<String, Expr>>, override val pos: Pos) : Expr
+data class ListE(val items: List<Expr>, override val pos: Pos) : Expr
+data class BlockE(val bindings: List<Binding>, val result: Expr, override val pos: Pos) : Expr
+data class Member(val target: Expr, val name: String, val nullSafe: Boolean, override val pos: Pos) : Expr
+data class MethodCall(val target: Expr, val name: String, val args: List<Arg>, override val pos: Pos) : Expr
+data class OpCall(val namespace: String, val operation: String, val params: Expr, val options: Expr?, override val pos: Pos) : Expr
+
+sealed interface Arg { val pos: Pos }
+data class ExprArg(val expr: Expr, override val pos: Pos) : Arg
+data class PredArg(val pred: Pred, override val pos: Pos) : Arg
+data class LambdaArg(val param: String, val body: Expr, override val pos: Pos) : Arg
+
+sealed interface Pred { val pos: Pos }
+data class Cmp(val op: String, val left: Expr, val right: Expr, override val pos: Pos) : Pred
+data class InP(val left: Expr, val right: Expr, override val pos: Pos) : Pred
+data class AndP(val terms: List<Pred>, override val pos: Pos) : Pred
+data class OrP(val terms: List<Pred>, override val pos: Pos) : Pred
+data class NotP(val term: Pred, override val pos: Pos) : Pred
+/** present() absent() contains(s) starts_with(s) ends_with(s) */
+data class TestP(val operand: Expr, val fn: String, val arg: Expr?, override val pos: Pos) : Pred
+/** operand.any(pred) / operand.all(pred) over a list-typed operand. */
+data class QuantP(val operand: Expr, val all: Boolean, val inner: Pred, override val pos: Pos) : Pred
+
+data class Binding(val name: String, val expr: Expr, val pos: Pos)
+data class InputDecl(val name: String, val type: Type, val pos: Pos)
+data class Program(val description: String?, val inputs: List<InputDecl>, val bindings: List<Binding>, val result: Expr)
+
+object Stdlib {
+    val EXPR = setOf("project", "flat", "flatten", "where", "compact", "distinct", "concat", "group", "single")
+    val AGG = setOf("count", "sum", "min", "max", "avg", "collect", "any", "all")
+    val NULL = setOf("or")
+    val STR = setOf("after_last", "before_first", "lower", "upper")
+    val TEST = setOf("present", "absent", "contains", "starts_with", "ends_with")
+    val PRED_ARG = setOf("where", "any", "all")
+    val ALL = EXPR + AGG + NULL + STR + "each"
+    val TYPE_KEYWORDS = setOf("string", "int", "number", "bool", "timestamp", "Null", "json", "list")
+    val KEYWORDS = setOf("towl", "input", "in", "true", "false", "null") + TYPE_KEYWORDS
+}
+
+// ── lexer ────────────────────────────────────────────────────────────────────
+
+enum class TK { IDENT, STRING, NUMBER, OP, EOF }
+data class Token(val kind: TK, val text: String, val pos: Pos)
+
+class Lexer(private val src: String) {
+    private var i = 0
+    private var line = 1
+    private var col = 1
+
+    fun tokens(): List<Token> {
+        val out = ArrayList<Token>()
+        while (true) {
+            skipTrivia()
+            if (i >= src.length) { out += Token(TK.EOF, "", Pos(line, col)); return out }
+            val pos = Pos(line, col)
+            val c = src[i]
+            when {
+                c.isLetter() || c == '_' -> {
+                    val start = i
+                    while (i < src.length && (src[i].isLetterOrDigit() || src[i] == '_')) adv()
+                    out += Token(TK.IDENT, src.substring(start, i), pos)
+                }
+                c.isDigit() || (c == '-' && i + 1 < src.length && src[i + 1].isDigit()) -> {
+                    val start = i
+                    adv()
+                    while (i < src.length && (src[i].isDigit() || src[i] == '.' || src[i] == 'e' || src[i] == 'E' ||
+                            ((src[i] == '-' || src[i] == '+') && (src[i - 1] == 'e' || src[i - 1] == 'E')))) adv()
+                    out += Token(TK.NUMBER, src.substring(start, i), pos)
+                }
+                c == '"' || c == '\'' -> out += Token(TK.STRING, string(c), pos)
+                else -> {
+                    val two = if (i + 1 < src.length) src.substring(i, i + 2) else ""
+                    val op = when {
+                        two in setOf("?.", "=>", "==", "!=", "<=", ">=", "&&", "||") -> two
+                        c in "()[]{}.,:=<>!|" -> c.toString()
+                        else -> throw TowlException(listOf(Diagnostic("error", "syntax", "syntax.badChar", pos, "unexpected character '$c'")))
+                    }
+                    repeat(op.length) { adv() }
+                    out += Token(TK.OP, op, pos)
+                }
+            }
+        }
+    }
+
+    private fun string(quote: Char): String {
+        val pos = Pos(line, col)
+        adv()
+        val sb = StringBuilder()
+        while (true) {
+            if (i >= src.length) throw TowlException(listOf(Diagnostic("error", "syntax", "syntax.unterminatedString", pos, "unterminated string")))
+            val c = src[i]
+            if (c == quote) { adv(); return sb.toString() }
+            if (c == '\\') {
+                adv()
+                val e = src.getOrNull(i) ?: continue
+                sb.append(when (e) { 'n' -> '\n'; 't' -> '\t'; 'r' -> '\r'; 'u' -> { val h = src.substring(i + 1, i + 5); repeat(4) { adv() }; h.toInt(16).toChar() }; else -> e })
+                adv()
+            } else { sb.append(c); adv() }
+        }
+    }
+
+    private fun skipTrivia() {
+        while (i < src.length) {
+            val c = src[i]
+            when {
+                c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == ';' -> adv() // ';' is an ignored separator
+                c == '#' || (c == '/' && i + 1 < src.length && src[i + 1] == '/') -> while (i < src.length && src[i] != '\n') adv()
+                else -> return
+            }
+        }
+    }
+
+    private fun adv() {
+        if (src[i] == '\n') { line++; col = 1 } else col++
+        i++
+    }
+}
+
+// ── parser ───────────────────────────────────────────────────────────────────
+
+class Parser(src: String, private val namespaces: Set<String>) {
+    private val t = Lexer(src).tokens()
+    private var p = 0
+
+    private fun peek(k: Int = 0) = t[minOf(p + k, t.size - 1)]
+    private fun at(text: String) = peek().kind == TK.OP && peek().text == text
+    private fun atIdent(text: String? = null) = peek().kind == TK.IDENT && (text == null || peek().text == text)
+    private fun err(code: String, msg: String, pos: Pos = peek().pos, fix: String? = null): Nothing =
+        throw TowlException(listOf(Diagnostic("error", "syntax", code, pos, msg, fix)))
+    private fun expect(text: String): Token = if (at(text)) t[p++] else err("syntax.expected", "expected '$text' but found '${peek().text.ifEmpty { "end of input" }}'")
+    private fun ident(): Token = if (peek().kind == TK.IDENT) t[p++] else err("syntax.expected", "expected a name but found '${peek().text.ifEmpty { "end of input" }}'")
+
+    fun program(): Program {
+        val head = ident()
+        if (head.text != "towl") err("syntax.header", "a program starts with 'towl 3'", head.pos)
+        val ver = peek()
+        if (ver.kind != TK.NUMBER || ver.text != "3") err("syntax.version", "unsupported TOWL version '${ver.text}'; this processor implements version 3", ver.pos)
+        p++
+        val description = if (peek().kind == TK.STRING) t[p++].text else null
+        val inputs = ArrayList<InputDecl>()
+        while (atIdent("input")) {
+            val pos = t[p++].pos
+            val name = ident().text
+            expect(":")
+            inputs += InputDecl(name, type(), pos)
+        }
+        val bindings = ArrayList<Binding>()
+        while (peek().kind == TK.IDENT && peek(1).kind == TK.OP && peek(1).text == "=") {
+            val name = t[p++]
+            expect("=")
+            bindings += Binding(name.text, expr(), name.pos)
+        }
+        if (peek().kind == TK.EOF) err("syntax.noResult", "a program ends with a result expression after its bindings")
+        val result = expr()
+        if (peek().kind != TK.EOF) err("syntax.trailing", "unexpected '${peek().text}' after the result expression", fix = "a program is: towl 3, inputs, bindings (name = expr), then exactly one result expression")
+        return Program(description, inputs, bindings, result)
+    }
+
+    fun type(): Type {
+        val tok = peek()
+        var base: Type = when {
+            tok.kind == TK.IDENT && tok.text in setOf("string", "int", "number", "bool", "timestamp", "Null", "json") -> {
+                p++
+                when (tok.text) { "string" -> TString; "int" -> TInt; "number" -> TNumber; "bool" -> TBool; "timestamp" -> TTimestamp; "Null" -> TNull; else -> TJson }
+            }
+            tok.kind == TK.IDENT && tok.text == "list" -> { p++; expect("["); val e = type(); expect("]"); TList(e) }
+            at("{") -> {
+                p++
+                val fields = LinkedHashMap<String, Type>()
+                while (!at("}")) {
+                    val n = ident().text; expect(":"); fields[n] = type()
+                    if (at(",")) p++ else break
+                }
+                expect("}")
+                TRecord(fields)
+            }
+            tok.kind == TK.IDENT && namespaces.contains(tok.text) && peek(1).text == "." -> {
+                p += 2; val shape = ident().text
+                err("syntax.shapeType", "catalog shape types (${tok.text}.$shape) are not available in this catalog; spell the record type out", tok.pos)
+            }
+            else -> err("syntax.type", "expected a type (string, int, number, bool, timestamp, Null, json, list[T], { field: T }) but found '${tok.text}'")
+        }
+        if (at("|")) { p++; val n = ident(); if (n.text != "Null") err("syntax.type", "only '| Null' may follow a type", n.pos); base = Types.nullable(base) }
+        return base
+    }
+
+    // expr = primary postfix*
+    fun expr(): Expr {
+        var e = primary()
+        while (at(".") || at("?.")) e = postfix(e)
+        return e
+    }
+
+    private fun postfix(target: Expr): Expr {
+        val dot = t[p++]
+        val nullSafe = dot.text == "?."
+        val name = ident()
+        return if (at("(") && !nullSafe && name.text in Stdlib.ALL) {
+            p++
+            val args = if (at(")")) emptyList() else args(name.text)
+            expect(")")
+            MethodCall(target, name.text, args, name.pos)
+        } else if (at("(") && !nullSafe && name.text in Stdlib.TEST) {
+            // test functions parse as method calls so predicate parsing can recognize them
+            p++
+            val args = if (at(")")) emptyList() else args(name.text)
+            expect(")")
+            MethodCall(target, name.text, args, name.pos)
+        } else if (at("(")) {
+            if (target is Ref && target.name !in namespaces)
+                err("catalog.unknownNamespace", "'${target.name}.${name.text}(...)' looks like an operation call, but '${target.name}' is not a namespace in this catalog", target.pos,
+                    "namespaces: ${namespaces.sorted().joinToString(", ").ifEmpty { "(none)" }}; there is no ${name.text} operation — use only operations the helper listed")
+            err("syntax.unknownFunction", "'${name.text}' is not a TOWL function", name.pos,
+                "functions: ${(Stdlib.ALL + Stdlib.TEST).sorted().joinToString(" ")}")
+        } else Member(target, name.text, nullSafe, name.pos)
+    }
+
+    private fun args(fn: String): List<Arg> {
+        val out = ArrayList<Arg>()
+        while (true) {
+            val pos = peek().pos
+            out += when {
+                fn == "each" || (peek().kind == TK.IDENT && peek(1).text == "=>") -> {
+                    val param = ident(); expect("=>")
+                    LambdaArg(param.text, expr(), pos)
+                }
+                fn in Stdlib.PRED_ARG -> PredArg(pred(), pos)
+                else -> ExprArg(expr(), pos)
+            }
+            if (at(",")) p++ else return out
+        }
+    }
+
+    private fun primary(): Expr {
+        val tok = peek()
+        return when {
+            tok.kind == TK.STRING -> { p++; Lit(tok.text, tok.pos) }
+            tok.kind == TK.NUMBER -> { p++; Lit(number(tok), tok.pos) }
+            tok.kind == TK.IDENT && tok.text == "true" -> { p++; Lit(true, tok.pos) }
+            tok.kind == TK.IDENT && tok.text == "false" -> { p++; Lit(false, tok.pos) }
+            tok.kind == TK.IDENT && tok.text == "null" -> { p++; Lit(null, tok.pos) }
+            at(".") || at("?.") -> {
+                // a path from the implicit element; postfix loop continues it
+                val root: Expr = Implicit(tok.pos)
+                postfix(root)
+            }
+            at("(") -> { p++; val e = expr(); expect(")"); e }
+            at("[") -> {
+                p++
+                val items = ArrayList<Expr>()
+                while (!at("]")) { items += expr(); if (at(",")) p++ else break }
+                expect("]")
+                ListE(items, tok.pos)
+            }
+            at("{") -> braces()
+            tok.kind == TK.IDENT && tok.text in namespaces && peek(1).text == "." && peek(2).kind == TK.IDENT && peek(3).text == "(" -> {
+                p += 3
+                val op = t[p - 1]
+                expect("(")
+                val params = expr()
+                val options = if (at(",")) { p++; expr() } else null
+                expect(")")
+                OpCall(tok.text, op.text, params, options, tok.pos)
+            }
+            tok.kind == TK.IDENT && tok.text in namespaces -> err("syntax.namespace", "'${tok.text}' is a catalog namespace; use it as ${tok.text}.operation(params)", tok.pos)
+            tok.kind == TK.IDENT && tok.text in Stdlib.KEYWORDS -> err("syntax.keyword", "'${tok.text}' is a keyword", tok.pos)
+            tok.kind == TK.IDENT -> { p++; Ref(tok.text, tok.pos) }
+            else -> err("syntax.unexpected", "unexpected '${tok.text.ifEmpty { "end of input" }}'")
+        }
+    }
+
+    private fun number(tok: Token): Any =
+        if (tok.text.contains('.') || tok.text.contains('e') || tok.text.contains('E')) tok.text.toDouble()
+        else tok.text.toLongOrNull()?.let { if (it in Int.MIN_VALUE..Int.MAX_VALUE) it.toInt() else it } ?: tok.text.toDouble()
+
+    /** `{` record | block | `{}` — decided by the token after the first identifier. */
+    private fun braces(): Expr {
+        val open = expect("{")
+        if (at("}")) { p++; return RecordE(emptyList(), open.pos) }
+        if (peek().kind != TK.IDENT) err("syntax.brace", "a '{' starts a record ({ name: value }) or a block ({ name = value ... result })")
+        return when (peek(1).text) {
+            ":" -> {
+                val fields = ArrayList<Pair<String, Expr>>()
+                while (!at("}")) {
+                    val n = ident(); expect(":")
+                    fields += n.text to expr()
+                    if (at(",")) p++ else if (!at("}")) err("syntax.expected", "expected ',' or '}' in record")
+                }
+                expect("}")
+                RecordE(fields, open.pos)
+            }
+            "=" -> {
+                val bindings = ArrayList<Binding>()
+                while (peek().kind == TK.IDENT && peek(1).text == "=") {
+                    val n = t[p++]; expect("=")
+                    bindings += Binding(n.text, expr(), n.pos)
+                }
+                if (at("}")) err("syntax.blockResult", "a block ends with a result expression after its bindings", fix = "add the value the block produces, e.g. a record { ... }")
+                val result = expr()
+                expect("}")
+                BlockE(bindings, result, open.pos)
+            }
+            else -> err("syntax.brace", "after '{ ${peek().text}' expected ':' (record field) or '=' (block binding)")
+        }
+    }
+
+    // ── predicates ──────────────────────────────────────────────────────────
+
+    fun pred(): Pred = predOr()
+
+    private fun predOr(): Pred {
+        val first = predAnd()
+        if (!at("||")) return first
+        val terms = arrayListOf(first)
+        while (at("||")) { p++; terms += predAnd() }
+        return OrP(terms, first.pos)
+    }
+
+    private fun predAnd(): Pred {
+        val first = predNot()
+        if (!at("&&")) return first
+        val terms = arrayListOf(first)
+        while (at("&&")) { p++; terms += predNot() }
+        return AndP(terms, first.pos)
+    }
+
+    private fun predNot(): Pred {
+        if (at("!")) { val pos = t[p++].pos; return NotP(predNot(), pos) }
+        if (at("(")) {
+            val save = p
+            try { p++; val inner = pred(); expect(")"); return inner } catch (_: TowlException) { p = save }
+        }
+        return predAtom()
+    }
+
+    private fun predAtom(): Pred {
+        val pos = peek().pos
+        val operand = expr()
+        val cmpOps = setOf("==", "!=", "<", "<=", ">", ">=")
+        if (peek().kind == TK.OP && peek().text in cmpOps) {
+            val op = t[p++].text
+            return Cmp(op, operand, expr(), pos)
+        }
+        if (atIdent("in")) { p++; return InP(operand, expr(), pos) }
+        if (operand is MethodCall) {
+            if (operand.name in Stdlib.TEST) {
+                val arg = operand.args.singleOrNull()?.let { (it as? ExprArg)?.expr }
+                if (operand.name in setOf("present", "absent") && operand.args.isNotEmpty()) err("syntax.predicate", "${operand.name}() takes no argument", operand.pos)
+                if (operand.name !in setOf("present", "absent") && arg == null) err("syntax.predicate", "${operand.name}(s) takes one string argument", operand.pos)
+                return TestP(operand.target, operand.name, arg, operand.pos)
+            }
+            if (operand.name == "any" || operand.name == "all") {
+                val inner = (operand.args.singleOrNull() as? PredArg)?.pred ?: err("syntax.predicate", "${operand.name}(...) takes one predicate", operand.pos)
+                return QuantP(operand.target, operand.name == "all", inner, operand.pos)
+            }
+        }
+        err("syntax.predicate", "expected a predicate: <operand> == <operand>, <operand> in [...], .field.present(), .field.contains(\"x\"), .list.any(<pred>), joined with && || !", pos)
+    }
+}
+
+/** Utility: source text with the offending line, for diagnostics. */
+fun excerpt(src: String, pos: Pos?): String? =
+    pos?.let { src.lines().getOrNull(it.line - 1)?.trim() }

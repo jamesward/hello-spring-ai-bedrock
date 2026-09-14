@@ -1,6 +1,7 @@
 package com.example.demo.synth
 
 import io.modelcontextprotocol.client.McpSyncClient
+import io.modelcontextprotocol.spec.McpSchema
 import org.slf4j.LoggerFactory
 import tools.jackson.databind.json.JsonMapper
 
@@ -24,11 +25,12 @@ class McpToolCatalog(clients: List<McpSyncClient>) {
         val inputSchema: Map<String, Any?>?,
         val outputSchema: Map<String, Any?>?,
         val client: McpSyncClient,
+        val annotations: McpSchema.ToolAnnotations? = null,
     )
 
     val tools: List<ToolInfo> = clients.flatMap { client ->
         client.listTools().tools().map { t ->
-            ToolInfo(t.name(), t.description(), t.inputSchema(), t.outputSchema(), client)
+            ToolInfo(t.name(), t.description(), t.inputSchema(), t.outputSchema(), client, t.annotations())
         }
     }
 
@@ -44,6 +46,8 @@ class McpToolCatalog(clients: List<McpSyncClient>) {
 
     fun client(toolName: String): McpSyncClient =
         (byName[toolName] ?: error("Unknown MCP tool: $toolName")).client
+
+    fun annotations(toolName: String): McpSchema.ToolAnnotations? = byName[toolName]?.annotations
 
     /** Compact JSON catalog (name, description, input + output schema) to embed in the planner prompt. */
     fun promptJson(): String {

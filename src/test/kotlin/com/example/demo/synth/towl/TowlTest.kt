@@ -4,528 +4,345 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertIs
+import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
-private fun service(catalog: TowlCatalog = FakeCatalog(), env: Map<String, Any?> = emptyMap()) =
-    TowlService(catalog, TowlRegistry.default(), env, maxConcurrency = 2)
+private fun service(catalog: FakeCatalog = FakeCatalog(), maxWidth: Int = 200, maxCalls: Int = 500) =
+    TowlService(catalog, maxConcurrency = 4, maxWidth = maxWidth, maxCalls = maxCalls)
 
-/** The full SYNTH scenario as one TOWL document; used by several phases below. */
-private val SYNTH_PLAN = """
-{
-  "towl": "v1",
-  "description": "summarize polymorphic type validation classes",
-  "let": {
-    "ver": {"source": {"call": {"operation": "get_latest_version",
-                                "args": {"groupId": "com.x", "artifactId": "y"}}}},
-    "syms": {
-      "source": {"call": {"operation": "list_javadoc_symbols",
-                          "args": {"version": {"ref": "ver", "path": "result"}}}},
-      "filter": {"contains": [{"path": "fqn"}, "Validator"]}
-    },
-    "docs": {
-      "forEach": {"sym": {
-        "from": {"ref": "syms"},
-        "source": {"call": {"operation": "get_javadoc_symbol",
-                            "args": {"version": {"ref": "ver", "path": "result"},
-                                     "link": {"ref": "sym", "path": "link"}}}},
-        "result": {"class": {"afterLast": [{"ref": "sym", "path": "fqn"}, "."]},
-                   "summary": {"path": ""}}
-      }},
-      "onError": "collect"
-    }
-  },
-  "result": {"ref": "docs"}
-}
+/** TOWL §14 example 7 against the fake catalog: the whole SYNTH scenario as one program. */
+private val SYNTH = """
+towl 3 "classes about polymorphic type validation, with a digest of each"
+ver  = javadocs.get_latest_version({ groupId: "com.x", artifactId: "y" }).result
+syms = javadocs.list_javadoc_symbols({ groupId: "com.x", artifactId: "y", version: ver })
+         .result.where(.fqn.contains("Validator"))
+syms.each(s => {
+  doc = javadocs.get_javadoc_symbol({ groupId: "com.x", artifactId: "y", version: ver, link: s.link })
+  { class: s.fqn.after_last("."), summary: llm.summarize({ text: doc }) }
+})
 """
 
-class TowlParserTest {
-    private val parser = TowlParser(TowlRegistry.default())
+@Suppress("UNCHECKED_CAST")
+private fun Map<String, Any?>.list(key: String) = this[key] as List<Any?>
+@Suppress("UNCHECKED_CAST")
+private fun Any?.rec() = this as Map<String, Any?>
 
-    @Test fun `parses the closed union`() {
-        val plan = parser.parse(SYNTH_PLAN)
-        val root = assertIs<Assemble>(plan.block)
-        assertEquals(setOf("ver", "syms", "docs"), root.let.keys)
-        assertIs<Express>(root.let["ver"])
-        val docs = assertIs<Traverse>(root.let["docs"])
-        assertEquals("sym", docs.elementName)
-        assertEquals(OnError.COLLECT, docs.onError)
-        assertIs<Express>(docs.body)
+private fun diagnostics(catalog: FakeCatalog, src: String): List<Diagnostic> =
+    assertFailsWith<TowlException> { service(catalog).validate(src) }.diagnostics
+
+private fun codes(catalog: FakeCatalog, src: String) = diagnostics(catalog, src).filter { it.severity == "error" }.map { it.code }
+
+class ParserTest {
+    private val ns = setOf("javadocs", "llm", "store")
+
+    @Test fun `parses the synth program`() {
+        val p = Parser(SYNTH, ns).program()
+        assertEquals(listOf("ver", "syms"), p.bindings.map { it.name })
+        val each = assertIs<MethodCall>(p.result)
+        assertEquals("each", each.name)
+        val lam = assertIs<LambdaArg>(each.args.single())
+        val body = assertIs<BlockE>(lam.body)
+        assertEquals("doc", body.bindings.single().name)
+        assertIs<OpCall>(body.bindings.single().expr)
     }
 
-    @Test fun `role mixtures match no block shape`() {
-        val e = assertFailsWith<TowlException> {
-            parser.parse("""{"towl":"v1","description":"x","source":{"ref":"a"},"let":{"b":{"result":1}}}""")
-        }
-        assertTrue(e.message!!.contains("match no block shape"), e.message)
+    @Test fun `record and block are told apart by the second token`() {
+        assertIs<RecordE>(Parser("towl 3 { a: 1 }", ns).program().result)
+        assertIs<BlockE>(Parser("towl 3 { a = 1  { b: a } }", ns).program().result)
+        assertIs<RecordE>(Parser("towl 3 {}", ns).program().result)
     }
 
-    @Test fun `duplicate keys are rejected`() {
-        assertFailsWith<TowlException> {
-            parser.parse("""{"towl":"v1","description":"x","result":1,"result":2}""")
-        }
+    @Test fun `predicates parse with precedence and nested quantifiers`() {
+        val p = Parser("""towl 3 xs.where(!.a.present() && .b == "x" || .items.any(.n > 3 && .k in ["p", "q"]))""", ns).program()
+        val where = assertIs<MethodCall>(p.result)
+        val pred = assertIs<PredArg>(where.args.single()).pred
+        val or = assertIs<OrP>(pred)
+        assertIs<AndP>(or.terms[0])
+        val q = assertIs<QuantP>(or.terms[1])
+        assertIs<AndP>(q.inner)
     }
 
-    @Test fun `version gate`() {
-        assertFailsWith<TowlException> { parser.parse("""{"towl":"v2","description":"x","result":1}""") }
+    @Test fun `wrong version and general-purpose forms are syntax errors`() {
+        for (bad in listOf("towl 2 \"x\" 1", "towl 3 xs.map(x => x)", "towl 3 xs.first()", "towl 3 javadocs", "towl 3 x = 1", "towl 3 1 2"))
+            assertFailsWith<TowlException>(bad) { Parser(bad, ns).program() }
     }
 
-    @Test fun `markdown fence is stripped and reported as preprocessing`() {
-        val plan = parser.parse("```json\n{\"towl\":\"v1\",\"description\":\"x\",\"result\":\"ok\"}\n```")
-        assertEquals(1, plan.preprocessing.size)
-        assertEquals("ok", ((plan.block as Assemble).result as RExpr).let { (it.expr as Lit).value })
-    }
-
-    @Test fun `unknown function names never become dynamic calls`() {
-        val e = assertFailsWith<TowlException> {
-            parser.parse("""{"towl":"v1","description":"x","source":{"ref":"a"},"filter":{"frobnicate":[1]}}""")
-        }
-        assertTrue(e.message!!.contains("frobnicate"), e.message)
-    }
-
-    @Test fun `a single unknown key in result position is a single-member product`() {
-        val plan = parser.parse("""{"towl":"v1","description":"x","result":{"frobnicate":[1]}}""")
-        val r = assertIs<RRecord>((plan.block as Assemble).result)
-        assertEquals(setOf("frobnicate"), r.members.keys)
-    }
-
-    @Test fun `reserved keys cannot be binder names`() {
-        assertFailsWith<TowlException> {
-            parser.parse("""{"towl":"v1","description":"x","let":{"ref":{"result":1}}}""")
-        }
-    }
-
-    @Test fun `onError collect is Traverse-only`() {
-        val e = assertFailsWith<TowlException> {
-            parser.parse("""{"towl":"v1","description":"x","source":{"ref":"a"},"onError":"collect"}""")
-        }
-        assertTrue(e.message!!.contains("collect"), e.message)
-    }
-
-    @Test fun `dedup must be non-empty`() {
-        assertFailsWith<TowlException> {
-            parser.parse("""{"towl":"v1","description":"x","source":{"ref":"a"},"dedup":[]}""")
-        }
-    }
-
-    @Test fun `a binding that fell out of let gets a brace hint`() {
-        // the live failure: "docs" closed one level too high, landing beside "let"
-        val e = assertFailsWith<TowlException> {
-            parser.parse("""{"towl":"v1","description":"x",
-                "let":{"ver":{"source":{"ref":"a"}}},
-                "docs":{"forEach":{"sym":{"from":{"ref":"ver"},"result":1}},"onError":"collect"},
-                "result":{"ref":"docs"}}""")
-        }
-        assertTrue(e.message!!.contains("INSIDE \"let\""), e.message)
-        assertTrue(e.message!!.contains("misplaced closing brace"), e.message)
-    }
-
-    @Test fun `malformed json errors carry a position`() {
-        val e = assertFailsWith<TowlException> {
-            parser.parse("""{"towl":"v1","description":"x",,"result":1}""")
-        }
-        assertTrue(e.message!!.contains("line") || e.message!!.contains("column"), e.message)
-    }
-
-    @Test fun `onError misplaced inside forEach gets a placement hint`() {
-        val e = assertFailsWith<TowlException> {
-            parser.parse("""{"towl":"v1","description":"x",
-                "forEach":{"sym":{"from":{"input":"xs"},"result":1},"onError":"collect"},
-                "inputs":{"xs":{"type":"array","default":[]}}}""")
-        }
-        assertTrue(e.message!!.contains("BESIDE \"forEach\""), e.message)
-        assertTrue(e.message!!.contains("{\"forEach\": {\"sym\": {...}}, \"onError\": ...}"), e.message)
-    }
-
-    @Test fun `body keys misplaced inside forEach get a placement hint`() {
-        val e = assertFailsWith<TowlException> {
-            parser.parse("""{"towl":"v1","description":"x",
-                "forEach":{"sym":{"from":{"input":"xs"},"result":1},"filter":{"present":[{"path":"a"}]}},
-                "inputs":{"xs":{"type":"array","default":[]}}}""")
-        }
-        assertTrue(e.message!!.contains("belongs inside the element body"), e.message)
-    }
-
-    @Test fun `the fn-wrapper hallucination gets a corrective diagnostic`() {
-        val e = assertFailsWith<TowlException> {
-            parser.parse("""{"towl":"v1","description":"x","source":{"ref":"a"},
-                "filter":{"fn":["or",{"contains":[{"path":"fqn"},"A"]},{"contains":[{"path":"fqn"},"B"]}]}}""")
-        }
-        assertTrue(e.message!!.contains("the function name IS the object key"), e.message)
-        assertTrue(e.message!!.contains("{\"or\": [...]}"), e.message)
-    }
-
-    @Test fun `paths reject positional indexes`() {
-        assertFailsWith<TowlException> {
-            parser.parse("""{"towl":"v1","description":"x","result":{"ref":"a","path":"items[0].name"}}""")
-        }
+    @Test fun `comments, trailing commas and single quotes are tolerated`() {
+        val p = Parser("towl 3 'd' // note\n# another\nx = [1, 2,]\n{ a: x, }", ns).program()
+        assertEquals(1, p.bindings.size)
     }
 }
 
-class TowlValidatorTest {
-    private val svc = service()
+class CheckerTest {
+    private val catalog = FakeCatalog()
 
-    @Test fun `synth plan validates and freezes resolutions`() {
-        val validated = svc.validate(svc.parse(SYNTH_PLAN))
-        assertEquals(3, validated.resolutions.size)
-        assertTrue(validated.warnings.isEmpty(), validated.warnings.toString())
+    @Test fun `types the synth program end to end`() {
+        val c = service(catalog).validate(SYNTH)
+        assertEquals("string", c.bindingTypes["ver"].toString())
+        assertEquals("list[${catalog.symbolType}]", c.bindingTypes["syms"].toString())
+        assertEquals("list[{ class: string, summary: string }]", c.resultType.toString())
+        assertEquals(listOf("javadocs.get_latest_version", "javadocs.list_javadoc_symbols", "javadocs.get_javadoc_symbol", "llm.summarize"), c.effects.map { it.op.id })
+        assertEquals(listOf(1, 1, null, null), c.effects.map { it.staticWidth })
+        assertEquals(1, c.waves.size)
+        assertTrue(c.warnings.isEmpty(), c.warnings.toString())
     }
 
-    @Test fun `unknown operation with did-you-mean`() {
-        val e = assertFailsWith<TowlException> {
-            svc.validate(svc.parse("""{"towl":"v1","description":"x",
-                "source":{"call":{"operation":"list_javadoc_symbolz","args":{"version":"1"}}}}"""))
-        }
-        assertTrue(e.message!!.contains("unknown operation"), e.message)
-        assertTrue(e.message!!.contains("list_javadoc_symbols"), e.message)
+    @Test fun `flat versus project is a visible type difference`() {
+        val src = """towl 3 javadocs.count_symbols({ version: "1" }).sizes"""
+        assertEquals("list[int]", service(catalog).validate(src).resultType.toString())
+        val nested = """towl 3
+            xs = [javadocs.count_symbols({ version: "1" }), javadocs.count_symbols({ version: "2" })]
+            { nested: xs.project(.sizes), flat: xs.flat(.sizes), n: xs.sum(.count) }"""
+        assertEquals("{ nested: list[list[int]], flat: list[int], n: int }", service(catalog).validate(nested).resultType.toString())
     }
 
-    @Test fun `argument schema is enforced`() {
-        val missing = assertFailsWith<TowlException> {
-            svc.validate(svc.parse("""{"towl":"v1","description":"x",
-                "source":{"call":{"operation":"get_latest_version","args":{"groupId":"g"}}}}"""))
-        }
-        assertTrue(missing.message!!.contains("artifactId"), missing.message)
-        val unknown = assertFailsWith<TowlException> {
-            svc.validate(svc.parse("""{"towl":"v1","description":"x",
-                "source":{"call":{"operation":"get_latest_version",
-                                  "args":{"groupId":"g","artifactId":"a","bogus":1}}}}"""))
-        }
-        assertTrue(unknown.message!!.contains("bogus"), unknown.message)
+    @Test fun `nullable members must go through null-safe access`() {
+        assertEquals(listOf("type.nullableAccess"), codes(catalog, """towl 3 javadocs.get_latest_version({ groupId: "g", artifactId: "a" }, { tolerate: ["NotFound"] }).result"""))
+        val ok = service(catalog).validate("""towl 3 javadocs.list_javadoc_symbols({ groupId: "g", artifactId: "a", version: "1" }).result.project(.kind.or("class"))""")
+        assertEquals("list[string]", ok.resultType.toString())
+        // string functions are total on string | Null and stay nullable
+        val nullable = service(catalog).validate("""towl 3 javadocs.list_javadoc_symbols({ groupId: "g", artifactId: "a", version: "1" }).result.project(.kind.upper())""")
+        assertEquals("list[string | Null]", nullable.resultType.toString())
     }
 
-    @Test fun `paginate is capability-gated`() {
-        val e = assertFailsWith<TowlException> {
-            svc.validate(svc.parse("""{"towl":"v1","description":"x",
-                "source":{"call":{"operation":"list_javadoc_symbols","args":{"version":"1"},
-                                  "paginate":{"maxItems":10}}}}"""))
-        }
-        assertTrue(e.message!!.contains("capability-gated"), e.message)
+    @Test fun `tolerate makes a call nullable and rejects transient codes`() {
+        val c = service(catalog).validate("""towl 3 javadocs.get_latest_version({ groupId: "g", artifactId: "a" }, { tolerate: ["NotFound"] })?.result""")
+        assertEquals("string | Null", c.resultType.toString())
+        assertEquals(listOf("catalog.tolerateClass"), codes(catalog, """towl 3 javadocs.get_latest_version({ groupId: "g", artifactId: "a" }, { tolerate: ["Throttling"] })"""))
     }
 
-    @Test fun `bare paths are scoped to Express stages and result`() {
-        val e = assertFailsWith<TowlException> {
-            svc.validate(svc.parse("""{"towl":"v1","description":"x",
-                "let":{"a":{"result":1}},
-                "result":{"path":"nope"}}"""))
-        }
-        assertTrue(e.message!!.contains("bare path"), e.message)
+    @Test fun `all diagnostics are reported in one pass`() {
+        val diags = codes(catalog, """towl 3
+            a = javadocs.get_latest_version({ groupId: "g" })
+            b = nothing.here
+            unused = 1
+            { a: a.result, b: b, c: javadocs.get_javadoc_symbol({ groupId: "g", artifactId: "a", version: "1", link: javadocs.get_latest_version({ groupId: "g", artifactId: "a" }).result }) }""")
+        assertTrue("catalog.missingParameter" in diags, diags.toString())
+        assertTrue("names.undefined" in diags, diags.toString())
+        assertTrue("names.unreferenced" in diags, diags.toString())
+        assertTrue("syntax.pureLayer" in diags, diags.toString())
     }
 
-    @Test fun `implicit paths never reach call args`() {
-        val e = assertFailsWith<TowlException> {
-            svc.validate(svc.parse("""{"towl":"v1","description":"x",
-                "source":{"call":{"operation":"get_latest_version",
-                                  "args":{"groupId":{"path":"g"},"artifactId":"a"}}}}"""))
-        }
-        assertTrue(e.message!!.contains("bare path"), e.message)
+    @Test fun `catalog checks name unknown operations members and parameters with fixes`() {
+        val d = diagnostics(catalog, """towl 3 javadocs.get_version({ group: "g" })""")
+        assertEquals("catalog.unknownOperation", d.single { it.severity == "error" }.code)
+        assertTrue(d.single { it.severity == "error" }.fix!!.contains("get_latest_version"))
+        val m = diagnostics(catalog, """towl 3 javadocs.get_latest_version({ groupId: "g", artifactId: "a" }).version""")
+        assertEquals("catalog.unknownMember", m.single { it.severity == "error" }.code)
     }
 
-    @Test fun `shadowing is invalid`() {
-        val e = assertFailsWith<TowlException> {
-            svc.validate(svc.parse("""{"towl":"v1","description":"x",
-                "let":{"a":{"result":1},
-                       "b":{"forEach":{"a":{"from":{"ref":"a"},"result":2}}}}, "result":{"ref":"b"}}"""))
-        }
-        assertTrue(e.message!!.contains("shadows"), e.message)
+    @Test fun `a wrapper member on a bare-string result names the operation in the fix`() {
+        // the live mistake: .result on get_javadoc_symbol, which returns the text itself
+        val d = diagnostics(catalog, """towl 3 javadocs.get_javadoc_symbol({ groupId: "g", artifactId: "a", version: "1", link: "x" }).result""")
+        val err = d.single { it.severity == "error" }
+        assertEquals("type.notRecord", err.code)
+        assertTrue(err.fix!!.contains("javadocs.get_javadoc_symbol returns the string itself") && err.fix!!.contains("drop '.result'"), err.fix)
     }
 
-    @Test fun `traversal depth is bounded at two`() {
-        val e = assertFailsWith<TowlException> {
-            svc.validate(svc.parse("""{"towl":"v1","description":"x",
-                "forEach":{"a":{"from":{"input":"xs"},
-                  "forEach":{"b":{"from":{"ref":"a"},
-                    "forEach":{"c":{"from":{"ref":"b"},"result":1}}}}}},
-                "inputs":{"xs":{"type":"array","default":[]}}}"""))
-        }
-        assertTrue(e.message!!.contains("depth"), e.message)
+    @Test fun `namespaces are reserved and paths need an element`() {
+        assertEquals(listOf("syntax.namespace"), codes(catalog, "towl 3 llm = 1\nllm"))
+        assertEquals(listOf("syntax.pathOutsideElement"), codes(catalog, """towl 3 x = javadocs.get_latest_version({ groupId: "g", artifactId: "a" })
+            { v: .result, x: x }"""))
     }
 
-    @Test fun `grouping rule rejects element-dependent pure leaves beside aggregates`() {
-        val e = assertFailsWith<TowlException> {
-            svc.validate(svc.parse("""{"towl":"v1","description":"x",
-                "source":{"call":{"operation":"list_javadoc_symbols","args":{"version":"1"}}},
-                "result":{"n":{"count":[]},"fqn":{"path":"fqn"}}}"""))
-        }
-        assertTrue(e.message!!.contains("non-grouped-column"), e.message)
-    }
-
-    @Test fun `ambiguous sinks require an explicit result`() {
-        val e = assertFailsWith<TowlException> {
-            svc.validate(svc.parse("""{"towl":"v1","description":"x",
-                "let":{"a":{"result":1},"b":{"result":2}}}"""))
-        }
-        assertTrue(e.message!!.contains("sink"), e.message)
-    }
-
-    @Test fun `unused forEach element variable warns but validates`() {
-        val v = svc.validate(svc.parse("""{"towl":"v1","description":"x",
-            "forEach":{"item":{"from":{"input":"xs"},"result":"constant"}},
-            "inputs":{"xs":{"type":"array","default":[1]}}}"""))
-        assertTrue(v.warnings.single().contains("never referenced"), v.warnings.toString())
-    }
-}
-
-class TowlRunTest {
-    @Test fun `runs the synth scenario end to end against the fake catalog`() {
-        val catalog = FakeCatalog()
-        val svc = service(catalog)
-        val result = svc.run(svc.validate(svc.parse(SYNTH_PLAN)))
-
-        @Suppress("UNCHECKED_CAST") val docs = result as List<Map<String, Any?>>
-        assertEquals(3, docs.size) // ObjectMapper filtered out before fan-out
-        val first = docs[0]["ok"] as Map<*, *>
-        assertEquals("PolymorphicTypeValidator", first["class"])
-        assertTrue((first["summary"] as String).startsWith("documentation for ptv.html"), first.toString())
-
-        // one version call, one list call, one doc call per filtered symbol — order preserved
-        assertEquals(listOf("get_latest_version", "list_javadoc_symbols"), catalog.calls.take(2).map { it.first })
-        assertEquals(3, catalog.calls.count { it.first == "get_javadoc_symbol" })
-        assertEquals("2.22.2", catalog.calls[1].second["version"])
-    }
-
-    @Test fun `collect turns per-element failures into data`() {
-        val catalog = FakeCatalog()
-        catalog.failOn = { id, args -> id == "get_javadoc_symbol" && args["link"] == "bptv.html" }
-        val svc = service(catalog)
-
-        @Suppress("UNCHECKED_CAST")
-        val docs = svc.run(svc.validate(svc.parse(SYNTH_PLAN))) as List<Map<String, Any?>>
-        assertEquals(3, docs.size)
-        val err = docs[1]["error"] as Map<*, *>
-        assertTrue((err["message"] as String).contains("boom"), err.toString())
-        assertEquals("bptv.html", (err["item"] as Map<*, *>)["link"])
-        assertTrue(docs[0].containsKey("ok") && docs[2].containsKey("ok"))
-    }
-
-    @Test fun `skip drops failed elements, fail aborts`() {
-        fun plan(onError: String) = """
-            {"towl":"v1","description":"x",
-             "forEach":{"sym":{
-               "from":{"input":"links"},
-               "source":{"call":{"operation":"get_javadoc_symbol",
-                                 "args":{"version":"1","link":{"ref":"sym"}}}},
-               "result":{"path":""}}},
-             "onError":"$onError",
-             "inputs":{"links":{"type":"array","default":["a.html","b.html","c.html"]}}}
-        """
-        val skipCat = FakeCatalog().also { it.failOn = { _, args -> args["link"] == "b.html" } }
-        val skipSvc = service(skipCat)
-        val kept = skipSvc.run(skipSvc.validate(skipSvc.parse(plan("skip")))) as List<*>
-        assertEquals(2, kept.size)
-
-        val failCat = FakeCatalog().also { it.failOn = { _, args -> args["link"] == "b.html" } }
-        val failSvc = service(failCat)
-        assertFailsWith<RuntimeException> { failSvc.run(failSvc.validate(failSvc.parse(plan("fail")))) }
-    }
-
-    @Test fun `express skip yields an explicitly absent value`() {
-        val catalog = FakeCatalog().also { it.failOn = { id, _ -> id == "get_latest_version" } }
-        val svc = service(catalog)
-        val result = svc.run(svc.validate(svc.parse("""
-            {"towl":"v1","description":"x",
-             "source":{"call":{"operation":"get_latest_version","args":{"groupId":"g","artifactId":"a"}}},
-             "onError":"skip"}""")))
-        assertNull(result)
-    }
-
-    @Test fun `aggregate result leaves fold the stream and preserve empty groups`() {
-        val svc = service()
-        val stats = svc.run(svc.validate(svc.parse("""
-            {"towl":"v1","description":"x",
-             "source":{"call":{"operation":"list_javadoc_symbols","args":{"version":"1"}}},
-             "filter":{"contains":[{"path":"fqn"},"Validator"]},
-             "result":{"n":{"count":[]},"names":{"collect":[{"afterLast":[{"path":"fqn"},"."]}]}}}"""))) as Map<*, *>
-        assertEquals(3L, stats["n"])
-        assertEquals(listOf("PolymorphicTypeValidator", "BasicPolymorphicTypeValidator", "SubTypeValidator"), stats["names"])
-
-        val empty = svc.run(svc.validate(svc.parse("""
-            {"towl":"v1","description":"x",
-             "source":{"call":{"operation":"list_javadoc_symbols","args":{"version":"1"}}},
-             "filter":{"contains":[{"path":"fqn"},"NoSuchThing"]},
-             "result":{"n":{"count":[]},"names":{"collect":[{"path":"fqn"}]}}}"""))) as Map<*, *>
-        assertEquals(0L, empty["n"])
-        assertEquals(emptyList<Any?>(), empty["names"])
-    }
-
-    @Test fun `dedup preserves first occurrence order`() {
-        val svc = service()
-        val out = svc.run(svc.validate(svc.parse("""
-            {"towl":"v1","description":"x",
-             "source":{"input":"xs"},
-             "dedup":[{"path":"k"}],
-             "result":{"path":"k"},
-             "inputs":{"xs":{"type":"array","default":[{"k":"b"},{"k":"a"},{"k":"b"},{"k":"c"}]}}}""")))
-        assertEquals(listOf("b", "a", "c"), out)
-    }
-
-    @Test fun `required inputs without defaults must be supplied`() {
-        val svc = service()
-        val v = svc.validate(svc.parse("""
-            {"towl":"v1","description":"x","result":{"input":"name"},
-             "inputs":{"name":{"type":"string"}}}"""))
-        assertFailsWith<TowlException> { svc.run(v) }
-        assertEquals("towl", svc.run(v, mapOf("name" to "towl")))
-    }
-
-    @Test fun `env is a closed schema`() {
-        val svc = service(env = mapOf("runId" to "r-1"))
-        val v = svc.validate(svc.parse("""{"towl":"v1","description":"x","result":{"env":"runId"}}"""))
-        assertEquals("r-1", svc.run(v))
-        assertFailsWith<TowlException> {
-            svc.validate(svc.parse("""{"towl":"v1","description":"x","result":{"env":"nope"}}"""))
-        }
-    }
-
-    @Test fun `document order does not matter — dependencies do`() {
-        val svc = service(FakeCatalog())
-        // 'second' is declared before 'first' but depends on it
-        val out = svc.run(svc.validate(svc.parse("""
-            {"towl":"v1","description":"x",
-             "let":{
-               "second":{"source":{"call":{"operation":"list_javadoc_symbols",
-                                           "args":{"version":{"ref":"first","path":"version"}}}}},
-               "first":{"source":{"call":{"operation":"get_latest_version",
-                                          "args":{"groupId":"g","artifactId":"a"}}}}},
-             "result":{"n":{"size":[{"ref":"second"}]}}}"""))) as Map<*, *>
-        assertEquals(4, out["n"])
-    }
-}
-
-class TowlExecutionResultTest {
-    private fun diag(r: ExecutionResult, binding: String): Map<String, Any?> =
-        r.diagnostics.single { it["binding"] == binding }
-
-    @Test fun `envelope carries per-binding accounting`() {
-        val svc = service(FakeCatalog())
-        val r = svc.execute(svc.validate(svc.parse(SYNTH_PLAN)))
-        assertEquals("ok", r.status)
-
-        val syms = diag(r, "syms")
-        assertEquals("list_javadoc_symbols", syms["operation"])
-        assertEquals(1L, syms["calls"])
-        assertEquals(4L, syms["streamed"])
-        assertEquals(3L, syms["filterKept"])
-        assertEquals(1L, syms["filterDropped"])
-
-        val docs = diag(r, "docs")
-        assertEquals(3L, docs["elements"])
-        assertEquals(3L, docs["ok"])
-
-        val body = diag(r, "docs.sym")
-        assertEquals("get_javadoc_symbol", body["operation"])
-        assertEquals(3L, body["calls"])
-    }
-
-    @Test fun `collected failures make the status partial`() {
-        val catalog = FakeCatalog()
-        catalog.failOn = { id, args -> id == "get_javadoc_symbol" && args["link"] == "bptv.html" }
-        val svc = service(catalog)
-        val r = svc.execute(svc.validate(svc.parse(SYNTH_PLAN)))
-        assertEquals("partial", r.status)
-        val docs = diag(r, "docs")
-        assertEquals(2L, docs["ok"])
-        assertEquals(1L, docs["failed"])
-    }
-
-    @Test fun `skipped elements make the status partial`() {
-        val catalog = FakeCatalog()
-        catalog.failOn = { id, args -> id == "get_javadoc_symbol" && args["link"] == "bptv.html" }
-        val svc = service(catalog)
-        val plan = SYNTH_PLAN.replace("\"collect\"", "\"skip\"")
-        val r = svc.execute(svc.validate(svc.parse(plan)))
-        assertEquals("partial", r.status)
-        assertEquals(1L, diag(r, "docs")["skipped"])
-        assertEquals(2, (r.result as List<*>).size)
-    }
-
-    @Test fun `run equals the envelope result`() {
-        val svc = service(FakeCatalog())
-        val v = svc.validate(svc.parse(SYNTH_PLAN))
-        assertEquals(svc.execute(v).result, svc.run(v))
-    }
-
-    @Test fun `an empty filter is visible in the envelope, not just absent from the result`() {
-        val svc = service(FakeCatalog())
-        val r = svc.execute(svc.validate(svc.parse(SYNTH_PLAN.replace("Validator", "NoSuchThing"))))
-        assertEquals("ok", r.status)
-        assertEquals(emptyList<Any?>(), r.result)
-        val syms = diag(r, "syms")
-        assertEquals(4L, syms["streamed"])
-        assertEquals(0L, syms["filterKept"])
-        assertEquals(0L, diag(r, "docs")["elements"])
-    }
-}
-
-class TowlExplainAndSchemaTest {
-    @Test fun `explain is a dry run — no invocations`() {
-        val catalog = FakeCatalog()
-        val svc = service(catalog)
-        val text = svc.explain(svc.validate(svc.parse(SYNTH_PLAN)))
+    @Test fun `static width is checked against the budget before anything runs`() {
+        val src = """towl 3 ["a", "b", "c"].each(v => javadocs.get_latest_version({ groupId: v, artifactId: "a" }).result)"""
+        assertEquals("list[string]", service(catalog).validate(src).resultType.toString())
+        val errs = assertFailsWith<TowlException> { service(catalog, maxWidth = 2).validate(src) }.diagnostics
+        assertEquals(listOf("each.staticWidthExceeded"), errs.filter { it.severity == "error" }.map { it.code })
         assertEquals(0, catalog.calls.size)
-        assertTrue(text.contains("wave 1: ver"), text)
-        assertTrue(text.contains("wave 2: syms"), text)
-        assertTrue(text.contains("wave 3: docs"), text)
-        assertTrue(text.contains("forEach sym (onError=collect)"), text)
-        assertTrue(text.contains("call get_latest_version [ONE]"), text)
-        assertTrue(text.contains("call list_javadoc_symbols [MANY]"), text)
-        assertTrue(text.contains("once per sym"), text)
     }
 
-    @Test fun `language guide is generated from the registry and carries no catalog`() {
-        val guide = TowlPrompt.languageGuide(TowlRegistry.default())
-        for (fn in listOf("contains", "afterLast")) assertTrue(guide.contains("$fn("), fn)
-        assertTrue(!guide.contains("take("), "removed function must not be advertised")
-        assertTrue(guide.contains("count()"))
-        assertTrue(guide.contains("closed shapes"))
-        assertTrue(guide.contains("How TOWL connects to the operation catalog"))
-        assertTrue(guide.contains("ALREADY removed"))
-        assertTrue(guide.contains("may be empty"))
-        assertTrue(guide.contains("the function name IS the single object key"))
-        assertTrue(guide.contains("never write {\"fn\": [...]}"))
-        assertTrue(guide.contains("BESIDE \"forEach\""))
-        assertTrue(guide.contains("pretty-print") || guide.contains("PRETTY-PRINT") || guide.contains("pretty-printed"))
-        assertTrue(guide.contains("legal ONLY when the plan declares it"))
-        // catalog-free: operations arrive through towlPlanHelper search, not the prompt
-        assertTrue(!guide.contains("list_javadoc_symbols"))
+    @Test fun `empty literals take their type from context or are rejected`() {
+        assertEquals("list[string]", service(catalog).validate("""towl 3 ["a"].concat([])""").resultType.toString())
+        assertEquals(listOf("type.emptyLiteral"), codes(catalog, "towl 3 []"))
+        assertEquals(listOf("type.emptyLiteral"), codes(catalog, "towl 3 { a: {} }"))
     }
 
-    @Test fun `catalog json states stream, value, and text return kinds with unwrapped element schemas`() {
-        val svc = service()
-        val mapper = tools.jackson.databind.json.JsonMapper.builder().build()
-        @Suppress("UNCHECKED_CAST")
-        val entries = mapper.readValue(TowlPrompt.catalogJson(FakeCatalog()), List::class.java) as List<Map<String, Any?>>
-        val byOp = entries.associateBy { it["operation"] }
-
-        val stream = byOp.getValue("list_javadoc_symbols")["returns"] as Map<*, *>
-        assertEquals("stream", stream["kind"])
-        val element = stream["element"] as Map<*, *>
-        val props = element["properties"] as Map<*, *>
-        assertTrue("fqn" in props && "link" in props, props.keys.toString())
-        assertTrue((stream["note"] as String).contains("wrapper"), stream["note"] as String)
-
-        val value = byOp.getValue("get_latest_version")["returns"] as Map<*, *>
-        assertEquals("value", value["kind"])
-        assertTrue((value["schema"] as Map<*, *>).containsKey("properties"))
-
-        val text = byOp.getValue("get_javadoc_symbol")["returns"] as Map<*, *>
-        assertEquals("text", text["kind"])
-        assertTrue((text["note"] as String).contains("{\"path\": \"\"}"), text["note"] as String)
-
-        // args schema is carried verbatim, including required
-        val args = byOp.getValue("get_latest_version")["args"] as Map<*, *>
-        assertEquals(listOf("groupId", "artifactId"), args["required"])
+    @Test fun `tolerate accepts only absence, authorization, availability and state codes`() {
+        for (c in listOf("NotFound", "AccessDenied", "OptInRequired", "InvalidState")) service(catalog).validate("""towl 3 javadocs.get_latest_version({ groupId: "g", artifactId: "a" }, { tolerate: ["$c"] })""")
+        for (c in listOf("Throttling", "ValidationException", "WeirdThing"))
+            assertEquals(listOf("catalog.tolerateClass"), codes(catalog, """towl 3 javadocs.get_latest_version({ groupId: "g", artifactId: "a" }, { tolerate: ["$c"] })"""), c)
     }
 
-    @Test fun `registry rejects reserved and overlapping names`() {
-        assertFailsWith<IllegalArgumentException> {
-            TowlRegistry(listOf(FunctionDef("ref", 1, 1, "bad") { it }), emptyList())
+    @Test fun `opaque json cannot be navigated`() {
+        val cat = object : TowlCatalog by catalog {
+            override val namespaces = catalog.namespaces + "raw"
+            override fun operation(namespace: String, name: String) =
+                if (namespace == "raw") OperationSpec("raw", "blob", null, null, TJson, Effect.READ) { mapOf("a" to 1) } else catalog.operation(namespace, name)
         }
-        assertFailsWith<IllegalArgumentException> {
-            TowlRegistry(
-                listOf(FunctionDef("count", 1, 1, "clash") { it }),
-                listOf(AggregatorDef("count", 0, "clash", 0L, { 1L }, { a, _ -> a })),
-            )
-        }
+        val errs = assertFailsWith<TowlException> { TowlService(cat).validate("towl 3 raw.blob({}).a") }.diagnostics
+        assertEquals("type.opaque", errs.single { it.severity == "error" }.code)
+        assertEquals("json", TowlService(cat).validate("towl 3 raw.blob({})").resultType.toString())
+    }
+}
+
+class RuntimeTest {
+
+    @Test fun `runs the synth program with a wave and reports nodes`() {
+        val catalog = FakeCatalog()
+        val s = service(catalog)
+        val out = s.execute(s.validate(SYNTH))
+        assertEquals("ok", out["status"])
+        val value = out.list("value")
+        assertEquals(3, value.size)
+        assertEquals(setOf("PolymorphicTypeValidator", "BasicPolymorphicTypeValidator", "SubTypeValidator"), value.map { it.rec()["class"] }.toSet())
+        assertTrue(value.all { (it.rec()["summary"] as String).startsWith("summary(") })
+        assertEquals(1 + 1 + 3 + 3, catalog.calls.size)
+        val nodes = out.list("nodes").map { it.rec() }
+        val where = nodes.single { it["node"] == "where" }
+        assertEquals(4L, (where["in"] as Number).toLong()); assertEquals(3L, (where["out"] as Number).toLong())
+        assertEquals(1, (out["accounting"].rec()["waves"] as Number).toInt())
+        assertEquals("list[{ class: string, summary: string }]", out["type"])
+    }
+
+    @Test fun `independent bindings run concurrently and join`() {
+        val catalog = FakeCatalog().apply { latencyMs = 150 }
+        val s = service(catalog)
+        val src = """towl 3
+            a = javadocs.get_latest_version({ groupId: "g", artifactId: "a" })
+            b = javadocs.count_symbols({ version: "1" })
+            { version: a.result, count: b.count }"""
+        val started = System.nanoTime()
+        val out = s.execute(s.validate(src))
+        val ms = (System.nanoTime() - started) / 1_000_000
+        assertEquals("ok", out["status"])
+        assertEquals(mapOf("version" to "2.22.2", "count" to 4), out["value"])
+        assertEquals(2, catalog.maxInFlight.get(), "both calls were in flight together")
+        assertTrue(ms < 280, "took ${ms}ms; expected the two 150ms calls to overlap")
+    }
+
+    @Test fun `result lists are in canonical order regardless of scheduling`() {
+        val catalog = FakeCatalog()
+        val s = service(catalog)
+        val src = """towl 3 javadocs.list_javadoc_symbols({ groupId: "g", artifactId: "a", version: "1" }).result.each(x => javadocs.get_javadoc_symbol({ groupId: "g", artifactId: "a", version: "1", link: x.link }))"""
+        val a = s.execute(s.validate(src))["value"]
+        val b = TowlService(catalog, maxConcurrency = 1).let { it.execute(it.validate(src))["value"] }
+        assertEquals(a, b)
+    }
+
+    @Test fun `group aggregate and predicates`() {
+        val s = service()
+        val src = """towl 3
+            syms = javadocs.list_javadoc_symbols({ groupId: "g", artifactId: "a", version: "1" }).result
+            syms.group(.kind).project({ kind: .key, n: .items.count(), names: .items.collect(.fqn) })"""
+        val out = s.execute(s.validate(src))
+        val groups = out.list("value").map { it.rec() }
+        assertEquals(setOf("class", "interface"), groups.map { it["kind"] }.toSet())
+        assertEquals(3, groups.single { it["kind"] == "class" }["n"])
+    }
+
+    @Test fun `tolerate yields null and is reported`() {
+        val catalog = FakeCatalog().apply { failOn = { id, a -> if (id == "javadocs.get_javadoc_symbol" && a["link"] == "om.html") OperationError("NotFound", "gone") else null } }
+        val s = service(catalog)
+        val src = """towl 3
+            javadocs.list_javadoc_symbols({ groupId: "g", artifactId: "a", version: "1" }).result.each(x => {
+              class: x.fqn.after_last("."),
+              doc: javadocs.get_javadoc_symbol({ groupId: "g", artifactId: "a", version: "1", link: x.link }, { tolerate: ["NotFound"] })
+            })"""
+        val c = s.validate(src)
+        assertEquals("list[{ class: string, doc: string | Null }]", c.resultType.toString())
+        val out = s.execute(c)
+        assertEquals("ok", out["status"])
+        assertNull(out.list("value").map { it.rec() }.single { it["class"] == "ObjectMapper" }["doc"])
+        assertEquals(1, out.list("tolerated").size)
+    }
+
+    @Test fun `an untolerated failure stops the program and returns only complete values`() {
+        val catalog = FakeCatalog().apply { failOn = { id, a -> if (id == "javadocs.get_javadoc_symbol" && a["link"] == "bptv.html") OperationError("AccessDenied", "no") else null } }
+        val s = service(catalog)
+        val out = s.execute(s.validate(SYNTH))
+        assertEquals("error", out["status"])
+        val err = out["error"].rec()
+        assertEquals("authorization", err["class"]); assertEquals("AccessDenied", err["code"]); assertEquals("tolerate-candidate", err["action"])
+        assertEquals("javadocs.get_javadoc_symbol", err["operation"])
+        val completed = out["completed"].rec()
+        assertEquals(setOf("ver", "syms"), completed.keys)
+        assertEquals("2.22.2", completed["ver"].rec()["value"])
+        val fan = out.list("fanout").single().rec()
+        assertEquals(1, fan.list("failed").size)
+        assertEquals("bptv.html", fan.list("failed").single().rec()["element"].rec()["link"])
+        assertEquals(3, fan.list("completed").size + fan.list("failed").size + fan.list("interrupted").size + fan.list("not_started").size)
+        assertNull(out["value"])
+    }
+
+    @Test fun `a resume program takes completed values as inputs`() {
+        val s = service()
+        val src = """towl 3 "resume"
+            input done: list[{ class: string, summary: string }]
+            input remaining: list[{ fqn: string, link: string, kind: string | Null }]
+            done.concat(remaining.each(x => { class: x.fqn.after_last("."), summary: llm.summarize({ text: x.link }) }))"""
+        val c = s.validate(src)
+        val out = s.execute(c, mapOf(
+            "done" to listOf(mapOf("class" to "A", "summary" to "s")),
+            "remaining" to listOf(mapOf("fqn" to "com.x.B", "link" to "b.html", "kind" to null)),
+        ))
+        assertEquals("ok", out["status"])
+        assertEquals(2, out.list("value").size)
+        val bad = s.execute(c, mapOf("done" to "not a list"))
+        assertEquals("error", bad["status"]); assertEquals("input", bad["error"].rec()["class"])
+    }
+
+    @Test fun `mutations are reported and their failures classed as mutation`() {
+        val catalog = FakeCatalog()
+        val s = service(catalog)
+        val ok = s.execute(s.validate("""towl 3
+            a = store.put({ key: "k", value: "v" })
+            b = store.put({ key: "k2", value: "v2" }, { after: a })
+            { a: a.ok, b: b.ok }"""))
+        assertEquals("ok", ok["status"])
+        assertEquals(2, ok.list("effects").size)
+        catalog.failOn = { id, _ -> if (id == "store.put") OperationError("Conflict", "busy") else null }
+        val bad = s.execute(s.validate("""towl 3 store.put({ key: "k", value: "v" }).ok"""))
+        assertEquals("mutation", bad["error"].rec()["class"]); assertEquals("mutation", bad["error"].rec()["action"])
+    }
+
+    @Test fun `budget stops before dispatching the wave`() {
+        val catalog = FakeCatalog()
+        val s = service(catalog, maxWidth = 2)
+        val src = """towl 3 javadocs.list_javadoc_symbols({ groupId: "g", artifactId: "a", version: "1" }).result.each(x => javadocs.get_javadoc_symbol({ groupId: "g", artifactId: "a", version: "1", link: x.link }))"""
+        val out = s.execute(s.validate(src))
+        assertEquals("error", out["status"]); assertEquals("budget", out["error"].rec()["class"])
+        assertEquals(1, catalog.calls.size, "only the list call ran; no body call was dispatched")
+    }
+
+    @Test fun `a result over the byte budget is a budget stop, and result size is accounted`() {
+        val catalog = FakeCatalog()
+        val small = TowlService(catalog, maxResultBytes = 64)
+        val src = """towl 3 javadocs.list_javadoc_symbols({ groupId: "g", artifactId: "a", version: "1" }).result"""
+        val out = small.execute(small.validate(src))
+        assertEquals("error", out["status"]); assertEquals("MaxResultBytes", out["error"].rec()["code"]); assertEquals("budget", out["error"].rec()["action"])
+        val ok = service(catalog).let { it.execute(it.validate(src)) }
+        assertTrue((ok["accounting"].rec()["result_bytes"] as Int) > 64)
+    }
+
+    @Test fun `NotFoundError-style codes classify as absence and can be tolerated`() {
+        assertEquals(ErrorClass.ABSENCE, TowlCatalog.defaultErrorClass("NotFoundError"))
+        assertEquals(ErrorClass.ABSENCE, TowlCatalog.defaultErrorClass("NoSuchBucketPolicy"))
+        assertEquals(ErrorClass.TRANSIENT, TowlCatalog.defaultErrorClass("ThrottlingException"))
+        service(FakeCatalog()).validate("""towl 3 javadocs.get_latest_version({ groupId: "g", artifactId: "a" }, { tolerate: ["NotFoundError"] })""")
+    }
+
+    @Test fun `single and string functions`() {
+        val s = service()
+        val out = s.execute(s.validate("""towl 3
+            syms = javadocs.list_javadoc_symbols({ groupId: "g", artifactId: "a", version: "1" }).result
+            { om: syms.where(.fqn.ends_with("ObjectMapper")).single()?.fqn.after_last("."), none: syms.where(.fqn == "nope").single(), up: "ab".upper() }"""))
+        assertEquals(mapOf("om" to "ObjectMapper", "none" to null, "up" to "AB"), out["value"])
+        val many = s.execute(s.validate("""towl 3 javadocs.list_javadoc_symbols({ groupId: "g", artifactId: "a", version: "1" }).result.single()"""))
+        assertEquals("cardinality", many["error"].rec()["class"])
+    }
+}
+
+class RenderTest {
+    @Test fun `typed rendering annotates bindings effects and the result`() {
+        val c = service().validate(SYNTH)
+        val typed = Render.typed(c)
+        assertTrue(typed.contains("// ver: string"), typed)
+        assertTrue(typed.contains("javadocs.get_javadoc_symbol read ×dynamic"), typed)
+        assertTrue(typed.contains("wave ×dynamic"), typed)
+        assertTrue(typed.contains("result: list[{ class: string, summary: string }]"), typed)
+        assertNotNull(Render.report(c)["effects"])
     }
 }
