@@ -41,7 +41,7 @@ object TowlPrompt {
         else
             "- Keep the result SMALL: project only the fields the answer needs. There is no truncation and this\n  catalog has no operation that shortens text: narrow with where(...) and return only what is asked."
         val exampleSum = if (sum != null) """,
-        { "name": "sum", "call": "${sum.id}", "params": { "text": {"${'$'}": "doc"} } }""" else ""
+        { "name": "sum", "call": "${sum.id}", "args": { "text": {"${'$'}": "doc"} } }""" else ""
         val exampleResult = if (sum != null) "{ class: s.fqn.after_last(\\\".\\\"), summary: sum }" else "{ class: s.fqn.after_last(\\\".\\\"), doc: doc }"
         return """
 TOWL v3 is a small typed expression language for one workflow of catalog operations plus pure
@@ -55,38 +55,46 @@ PROGRAM (pass it to the tools as this structured object)
     "result":   "expr" }                         # one result expression (text) — its value is the answer
   A <binding> is exactly one of:
     { "name": "x", "value": "expr" }                                   # any TOWL expression in text
-    { "name": "x", "call": "ns.op", "params": { ...JSON... },           # an operation call; params is a real JSON object:
-      "options": { "tolerate": ["Code"], "after": ["y"] }, "then": ".result.where(...)" }   #   literal data as-is, references as {"$": "ver"} or {"$": "s.link"}
-    { "name": "x", "each": { "over": "list expr", "as": "s", "bindings": [ <binding>, ... ], "result": "expr" } }   # fan-out with per-element calls
+    { "name": "x", "call": "ns.op", "args": { ...JSON... },             # an operation call; args is a real JSON object (omit if none):
+      "options": { "tolerate": ["Code"] }, "then": ".result.where(...)" }   #   literal data as-is, references as {"$": "ver"} or {"$": "s.link"}
+    { "name": "x", "for": { "over": "list expr", "as": "s", "bindings": [ <binding>, ... ], "result": "expr" } }   # fan-out with per-element calls
 
 VALUES: "str"  12  1.5  true  null  [a, b]  { key: value }
-CALLS (the ONLY effects): namespace.operation({ Param: value, ... })
-  Parameters are a record checked against the operation's params type. A second argument holds
-  options: namespace.operation({...}, { tolerate: ["SomeErrorCode"] }) makes that error yield null
-  instead of stopping the program; { after: otherBinding } orders two calls that share no data.
-  Calls may NOT appear inside paths, shapes, predicates, or another call's parameters: bind them.
-MEMBERS: x.Field   x?.Field (when x may be null)   x.or(default)  (replaces null)
-FAN-OUT (the only binder): list.each(x => body)   -> list[body type]; bodies may call operations.
-  A body with several steps is a block: list.each(x => { a = ...  b = ...  { out: a, n: b } })
+CALLS (the ONLY effects) in expression text: call("namespace", "operation", { param: value, ... }, { tolerate: ["Code"] })
+  Namespace and operation are string literals; args and options may be omitted. Args are checked against
+  the operation's schema. tolerate makes the listed error codes yield null instead of stopping the program;
+  Ordering comes from data: a call that uses another call's result runs after it. Calls may NOT appear inside paths, shapes, predicates, or
+  another call's args: bind them first.
+MEMBERS: x.Field   x?.Field (when x may be null; the result is nullable too)
+FAN-OUT (the only binder), in expression text: for x in list <body>  -> list[body type]; bodies are independent and concurrent.
+  One-line body (a record or any expression):  for s in syms { name: s.fqn }
+  Multi-line body: bindings then the result, indented under the for line; the result is the LAST line. Braces are
+  only records; bindings go on their own lines. There are no lambdas ('=>'), no .map/.each. In the structured
+  form use the { name, for: {...} } node instead.
 LIST FUNCTIONS take a PATH from the element (.Field.Sub) or a PREDICATE, never a function:
   .project(.Field) -> list[T]        .project({ name: .Field, n: .Items.count() }) -> list[record]
   .flat(.Items)    -> list[T]        flattens one list-typed member per element (use this, not project, for a flat list)
   .flatten()       -> list[T]        list[list[T]] -> list[T]
-  .where(pred)     -> list[T]        pred: .A == "x"  .A != 1  .A < 5  .A in ["x","y"]  .A.present()  .A.absent()
+  .where(pred)     -> list[T]        pred: .A == "x"  .A != 1  .N < 5 (Null compares false)  .A in ["x","y"]  .A.present()  .A.absent()  .L.empty()
                                       .A.contains("s") .A.starts_with("s") .A.ends_with("s")  .L.any(pred)  .L.all(pred)
                                       combined with && || ! ( )
   .compact()       -> list[T]        drops nulls        .distinct() / .distinct(.Key)      .concat(otherList)
   .group(.Key)     -> list[{ key, items }]              .single() -> T | Null  (0 -> null, 2+ -> error)
 AGGREGATES: .count() -> int   .sum(.N) .avg(.N)   .min(.N) .max(.N)   .collect(.Field) -> list   .any(pred) .all(pred)
+  .top(5, .Size) / .bottom(5, .Size) -> list[{ rank: int, value: T }]  the n largest/smallest by a key (rank is data; lists are unordered)
+  On a list of scalars the path may be omitted: xs.sum()  xs.max()  xs.top(3)
 STRINGS: s.after_last(".")  s.before_first("/")  s.lower()  s.upper()
+TIME: now (timestamp) and today ("YYYY-MM-DD") are predefined, no declaration needed: now.minus_days(4)  .minus_hours(6)  .minus_minutes(30)  .start_of_day()  .start_of_month()  .date() -> "YYYY-MM-DD"
 TYPES you will see: string int number bool timestamp json list[T] { field: T } and T | Null (may be absent).
-  A member typed T | Null must go through ?. or .or(...) before use. json is opaque: use it whole.
+  T | Null values have no default operator. Pass them to args AS IS (a Null at runtime stops with a 'data' error
+  naming the element), reach through them with ?., compare them (Null is never equal/less/greater), aggregate
+  them (Null is skipped), and keep them nullable in results (Null is reported as Null). json is opaque: use it whole.
 
 RULES
 - Read each operation's "returns" type: if it is a record, access its members (.result, .items);
   if it is a bare string/json, the call's value IS the result — never invent a wrapper member.
 - Search the catalog by what an operation DOES; task subjects (names, ids) are parameter values.
-- Filter before you fan out; fan out (each) only when each element needs its own operation call.
+- Filter before you fan out; fan out (for) only when each element needs its own operation call.
 - Any runtime error stops the program and you get a report of what completed; fix the program and
   run again, or declare tolerate for an error code the report showed. Do not guess error codes.
 $shortenRule
@@ -97,17 +105,17 @@ $shortenRule
 EXAMPLE (structure only — use real operation names and parameters from the catalog)
 { "towl": 3, "description": "classes about validation, with a digest of each",
   "bindings": [
-    { "name": "ver",  "call": "docs.get_latest_version", "params": { "groupId": "g", "artifactId": "a" }, "then": ".result" },
-    { "name": "syms", "call": "docs.list_symbols", "params": { "groupId": "g", "artifactId": "a", "version": {"$": "ver"} },
+    { "name": "ver",  "call": "docs.get_latest_version", "args": { "groupId": "g", "artifactId": "a" }, "then": ".result" },
+    { "name": "syms", "call": "docs.list_symbols", "args": { "groupId": "g", "artifactId": "a", "version": {"$": "ver"} },
       "then": ".result.where(.fqn.contains(\"Validator\"))" },
-    { "name": "digests", "each": { "over": "syms", "as": "s",
+    { "name": "digests", "for": { "over": "syms", "as": "s",
       "bindings": [
-        { "name": "doc", "call": "docs.get_doc", "params": { "groupId": "g", "artifactId": "a", "version": {"$": "ver"}, "link": {"$": "s.link"} } }$exampleSum
+        { "name": "doc", "call": "docs.get_doc", "args": { "groupId": "g", "artifactId": "a", "version": {"$": "ver"}, "link": {"$": "s.link"} } }$exampleSum
       ],
       "result": "$exampleResult" } }
   ],
   "result": "digests" }
-Never write a reference as a plain string in params ("version": "ver" is the LITERAL text ver); use {"$": "ver"}.
+Never write a reference as a plain string in args ("version": "ver" is the LITERAL text ver); use {"$": "ver"}.
 (docs.* above are placeholders; the only real namespaces are listed next.)
 
 Namespaces in this catalog: ${catalog.namespaces.sorted().joinToString(", ")}

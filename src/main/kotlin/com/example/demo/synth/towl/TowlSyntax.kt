@@ -43,7 +43,8 @@ data class RecordE(val fields: List<Pair<String, Expr>>, override val pos: Pos) 
 data class ListE(val items: List<Expr>, override val pos: Pos) : Expr
 data class BlockE(val bindings: List<Binding>, val result: Expr, override val pos: Pos) : Expr
 data class Member(val target: Expr, val name: String, val nullSafe: Boolean, override val pos: Pos) : Expr
-data class MethodCall(val target: Expr, val name: String, val args: List<Arg>, override val pos: Pos) : Expr
+data class MethodCall(val target: Expr, val name: String, val args: List<Arg>, override val pos: Pos, val multiline: Boolean = false,
+                      val layout: Pair<Int?, Int?> = null to null) : Expr
 data class OpCall(val namespace: String, val operation: String, val params: Expr, val options: Expr?, override val pos: Pos) : Expr
 
 sealed interface Arg { val pos: Pos }
@@ -68,14 +69,21 @@ data class Program(val description: String?, val inputs: List<InputDecl>, val bi
 
 object Stdlib {
     val EXPR = setOf("project", "flat", "flatten", "where", "compact", "distinct", "concat", "group", "single")
-    val AGG = setOf("count", "sum", "min", "max", "avg", "collect", "any", "all")
-    val NULL = setOf("or")
+    val AGG = setOf("count", "sum", "min", "max", "avg", "collect", "any", "all", "top", "bottom")
     val STR = setOf("after_last", "before_first", "lower", "upper")
-    val TEST = setOf("present", "absent", "contains", "starts_with", "ends_with")
+    val TIME = setOf("minus_days", "minus_hours", "minus_minutes", "start_of_day", "start_of_month", "date")
+    val TEST = setOf("present", "absent", "empty", "contains", "starts_with", "ends_with")
     val PRED_ARG = setOf("where", "any", "all")
-    val ALL = EXPR + AGG + NULL + STR + "each"
+    val ALL = EXPR + AGG + STR + TIME
+    const val FOR_FORM = "the binder is written: for x in xs  then the body: a record on the same line, or bindings and a result on indented lines"
+    val REMOVED = mapOf(
+        "or" to "'.or' was removed: keep the value nullable (T | Null); use ?. to reach through it and pass it to arguments as is",
+        "each" to "'each' is now a for expression: $FOR_FORM",
+        "map" to "'map' is now a for expression: $FOR_FORM",
+    )
+    const val CALL_FORM = "operation calls are written call(\"namespace\", \"operation\", { param: value }, { tolerate: [...] }); args and options may be omitted"
     val TYPE_KEYWORDS = setOf("string", "int", "number", "bool", "timestamp", "Null", "json", "list")
-    val KEYWORDS = setOf("towl", "input", "in", "true", "false", "null") + TYPE_KEYWORDS
+    val KEYWORDS = setOf("towl", "input", "in", "for", "call", "true", "false", "null") + TYPE_KEYWORDS
 }
 
 // ── lexer ────────────────────────────────────────────────────────────────────
@@ -113,7 +121,7 @@ class Lexer(private val src: String) {
                     val two = if (i + 1 < src.length) src.substring(i, i + 2) else ""
                     val op = when {
                         two in setOf("?.", "=>", "==", "!=", "<=", ">=", "&&", "||") -> two
-                        c in "()[]{}.,:=<>!|" -> c.toString()
+                        c in "()[]{}.,:=<>!|@" -> c.toString()
                         else -> throw TowlException(listOf(Diagnostic("error", "syntax", "syntax.badChar", pos, "unexpected character '$c'")))
                     }
                     repeat(op.length) { adv() }
@@ -144,7 +152,8 @@ class Lexer(private val src: String) {
         while (i < src.length) {
             val c = src[i]
             when {
-                c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == ';' -> adv() // ';' is an ignored separator
+                c == '\t' -> throw TowlException(listOf(Diagnostic("error", "syntax", "syntax.tab", Pos(line, col), "tab characters are not allowed; indentation is significant and uses spaces", "indent with 2 spaces per level")))
+                c == ' ' || c == '\r' || c == '\n' || c == ';' -> adv() // ';' is an ignored separator
                 c == '#' || (c == '/' && i + 1 < src.length && src[i + 1] == '/') -> while (i < src.length && src[i] != '\n') adv()
                 else -> return
             }
@@ -159,9 +168,46 @@ class Lexer(private val src: String) {
 
 // ── parser ───────────────────────────────────────────────────────────────────
 
-class Parser(src: String, private val namespaces: Set<String>) {
+class Parser(src: String, private val namespaces: Set<String>) { // namespaces: only for `ns.Shape` type names
     private val t = Lexer(src).tokens()
     private var p = 0
+    /** bracket depth at each token: layout is suspended inside brackets */
+    private val depth: IntArray = IntArray(t.size).also { d ->
+        var k = 0
+        for ((i, tok) in t.withIndex()) {
+            if (tok.kind == TK.OP && tok.text in setOf(")", "]", "}")) k = maxOf(0, k - 1)
+            d[i] = k
+            if (tok.kind == TK.OP && tok.text in setOf("(", "[", "{")) k++
+        }
+    }
+    /** indentation (column) of each open block; null until its first line-starting item */
+    private val blocks = ArrayList<Int?>()
+
+    private fun startsLine(i: Int = p) = i == 0 || t[i].pos.line > t[i - 1].pos.line
+
+    /** at the first token of a block item: check it against the block's indentation */
+    private fun itemStart() {
+        val tok = peek()
+        if (tok.kind == TK.EOF || !startsLine() || depth[p] > 0 || blocks.isEmpty()) return
+        val indent = blocks.last()
+        if (indent == null) blocks[blocks.size - 1] = tok.pos.col
+        else if (tok.pos.col != indent) err("syntax.indent", "'${tok.text}' is indented to column ${tok.pos.col} but the items of this block start at column $indent", tok.pos,
+            "items of one block (bindings and the result) share one indentation; a continuation line starts with '.'")
+    }
+
+    /** `binding* expr` at the current block's indentation; the block ends at its result */
+    private fun blockItems(what: String): Pair<List<Binding>, Expr> {
+        val bindings = ArrayList<Binding>()
+        while (peek().kind == TK.IDENT && peek(1).kind == TK.OP && peek(1).text == "=") {
+            itemStart()
+            val name = t[p++]
+            expect("=")
+            bindings += Binding(name.text, expr(), name.pos)
+        }
+        if (peek().kind == TK.EOF) err("syntax.noResult", "a $what ends with a result expression after its bindings")
+        itemStart()
+        return bindings to expr()
+    }
 
     private fun peek(k: Int = 0) = t[minOf(p + k, t.size - 1)]
     private fun at(text: String) = peek().kind == TK.OP && peek().text == text
@@ -178,22 +224,21 @@ class Parser(src: String, private val namespaces: Set<String>) {
         if (ver.kind != TK.NUMBER || ver.text != "3") err("syntax.version", "unsupported TOWL version '${ver.text}'; this processor implements version 3", ver.pos)
         p++
         val description = if (peek().kind == TK.STRING) t[p++].text else null
+        blocks += null
         val inputs = ArrayList<InputDecl>()
         while (atIdent("input")) {
+            itemStart()
             val pos = t[p++].pos
             val name = ident().text
             expect(":")
             inputs += InputDecl(name, type(), pos)
         }
-        val bindings = ArrayList<Binding>()
-        while (peek().kind == TK.IDENT && peek(1).kind == TK.OP && peek(1).text == "=") {
-            val name = t[p++]
-            expect("=")
-            bindings += Binding(name.text, expr(), name.pos)
+        val (bindings, result) = blockItems("program")
+        if (peek().kind != TK.EOF) {
+            if (peek().kind == TK.IDENT && peek(1).text == "=")
+                err("syntax.trailing", "binding '${peek().text}' comes after the result expression", fix = "the result is the last line of the program; move this binding above it")
+            err("syntax.trailing", "unexpected '${peek().text}' after the result expression", fix = "a program is: towl 3, inputs, bindings (name = expr), then exactly one result expression")
         }
-        if (peek().kind == TK.EOF) err("syntax.noResult", "a program ends with a result expression after its bindings")
-        val result = expr()
-        if (peek().kind != TK.EOF) err("syntax.trailing", "unexpected '${peek().text}' after the result expression", fix = "a program is: towl 3, inputs, bindings (name = expr), then exactly one result expression")
         return Program(description, inputs, bindings, result)
     }
 
@@ -228,14 +273,29 @@ class Parser(src: String, private val namespaces: Set<String>) {
     // expr = primary postfix*
     fun expr(): Expr {
         var e = primary()
-        while (at(".") || at("?.")) e = postfix(e)
+        if (e is MethodCall && e.name == "for" && e.multiline) {
+            // a laid-out body ends the expression, except for continuation lines indented between the
+            // `for` line and its body: those apply to the for expression itself (`  .flatten()`)
+            val (header, body) = e.layout
+            while ((at(".") || at("?.")) && startsLine() && depth[p] == 0 && header != null && body != null && peek().pos.col > header && peek().pos.col < body)
+                e = postfix(e)
+            return e
+        }
+        while ((at(".") || at("?.")) && !dedentedContinuation()) e = postfix(e)
         return e
+    }
+
+    /** a `.` line indented less than the current block's items belongs to an enclosing expression */
+    private fun dedentedContinuation(): Boolean {
+        val indent = blocks.lastOrNull() ?: return false
+        return startsLine() && depth[p] == 0 && peek().pos.col < indent
     }
 
     private fun postfix(target: Expr): Expr {
         val dot = t[p++]
         val nullSafe = dot.text == "?."
         val name = ident()
+        if (name.text in Stdlib.REMOVED && (at("(") || at("@"))) err("syntax.removed", Stdlib.REMOVED.getValue(name.text), name.pos)
         return if (at("(") && !nullSafe && name.text in Stdlib.ALL) {
             p++
             val args = if (at(")")) emptyList() else args(name.text)
@@ -248,28 +308,71 @@ class Parser(src: String, private val namespaces: Set<String>) {
             expect(")")
             MethodCall(target, name.text, args, name.pos)
         } else if (at("(")) {
-            if (target is Ref && target.name !in namespaces)
-                err("catalog.unknownNamespace", "'${target.name}.${name.text}(...)' looks like an operation call, but '${target.name}' is not a namespace in this catalog", target.pos,
-                    "namespaces: ${namespaces.sorted().joinToString(", ").ifEmpty { "(none)" }}; there is no ${name.text} operation — use only operations the helper listed")
+            if (target is Ref) // the retired `namespace.operation(...)` form
+                err("syntax.callForm", "'${target.name}.${name.text}(...)' is not how operations are called", name.pos,
+                    "write call(\"${target.name}\", \"${name.text}\", { ... }); ${Stdlib.CALL_FORM}")
             err("syntax.unknownFunction", "'${name.text}' is not a TOWL function", name.pos,
-                "functions: ${(Stdlib.ALL + Stdlib.TEST).sorted().joinToString(" ")}")
+                "functions: ${(Stdlib.ALL + Stdlib.TEST).sorted().joinToString(" ")}; an operation is call(\"namespace\", \"operation\", { ... })")
         } else Member(target, name.text, nullSafe, name.pos)
+    }
+
+    /** `for x in source` then a body: a single expression on the same line, or an indented block. */
+    private fun forExpr(): Expr {
+        val kw = t[p++]
+        if (at("(")) err("syntax.forForm", "'for' takes no parentheses", peek().pos, Stdlib.FOR_FORM)
+        val param = ident()
+        if (!atIdent("in")) err("syntax.forForm", "expected 'in' after 'for ${param.text}'", peek().pos, Stdlib.FOR_FORM)
+        p++
+        val source = expr()
+        if (at(":") && !startsLine()) p++ // the Python reflex; accepted and dropped by the canonical rendering
+        val nxt = peek()
+        if (nxt.kind == TK.EOF) err("syntax.forBody", "'for ${param.text} in ...' has no body", kw.pos, Stdlib.FOR_FORM)
+        if (!startsLine()) {
+            if (at("{") && peek(1).kind == TK.IDENT && peek(2).text == "=")
+                err("syntax.forBody", "a for body with bindings is written on indented lines, not in braces", nxt.pos, Stdlib.FOR_FORM)
+            return MethodCall(source, "for", listOf(LambdaArg(param.text, expr(), param.pos)), kw.pos, multiline = false)
+        }
+        val headerIndent = blocks.lastOrNull()
+        val checked = depth[p] == 0
+        if (checked && headerIndent != null && nxt.pos.col <= headerIndent)
+            err("syntax.indent", "the body of 'for ${param.text}' must be indented more than the line that starts it (column $headerIndent)", nxt.pos, Stdlib.FOR_FORM)
+        blocks += if (checked) nxt.pos.col else null
+        val (bindings, result) = blockItems("for ${param.text} body")
+        val bodyIndent = blocks.removeAt(blocks.size - 1)
+        val after = peek()
+        if (checked && after.kind != TK.EOF && startsLine() && depth[p] == 0 && headerIndent != null && after.pos.col > headerIndent
+            && !(after.text in setOf(".", "?.") && bodyIndent != null && after.pos.col < bodyIndent))
+            err("syntax.resultNotLast", "this line is indented as part of the 'for ${param.text}' body, but that body already ended with its result on line ${result.pos.line}", after.pos,
+                "the result of a body is its last line: move the result below this line, or bind this value before the result")
+        val body: Expr = if (bindings.isEmpty()) result else BlockE(bindings, result, nxt.pos)
+        return MethodCall(source, "for", listOf(LambdaArg(param.text, body, param.pos)), kw.pos, multiline = true, layout = headerIndent to bodyIndent)
     }
 
     private fun args(fn: String): List<Arg> {
         val out = ArrayList<Arg>()
         while (true) {
             val pos = peek().pos
-            out += when {
-                fn == "each" || (peek().kind == TK.IDENT && peek(1).text == "=>") -> {
-                    val param = ident(); expect("=>")
-                    LambdaArg(param.text, expr(), pos)
-                }
-                fn in Stdlib.PRED_ARG -> PredArg(pred(), pos)
-                else -> ExprArg(expr(), pos)
-            }
+            if (peek().kind == TK.IDENT && peek(1).text == "=>") err("syntax.lambda", "TOWL has no lambdas", pos, Stdlib.FOR_FORM)
+            out += if (fn in Stdlib.PRED_ARG) PredArg(pred(), pos) else ExprArg(expr(), pos)
             if (at(",")) p++ else return out
         }
+    }
+
+    /** `call("namespace", "operation", args?, options?)` */
+    private fun call(): Expr {
+        val kw = ident()
+        expect("(")
+        val ns = peek()
+        if (ns.kind != TK.STRING) err("syntax.callForm", "the first argument of call is the namespace as a string", ns.pos, Stdlib.CALL_FORM)
+        p++; expect(",")
+        val op = peek()
+        if (op.kind != TK.STRING) err("syntax.callForm", "the second argument of call is the operation name as a string", op.pos, Stdlib.CALL_FORM)
+        p++
+        var params: Expr? = null; var options: Expr? = null
+        if (at(",")) { p++; params = expr(); if (at(",")) { p++; options = expr() } }
+        if (at(",")) err("syntax.callForm", "call takes at most four arguments", peek().pos, Stdlib.CALL_FORM)
+        expect(")")
+        return OpCall(ns.text, op.text, params ?: RecordE(emptyList(), kw.pos), options, kw.pos)
     }
 
     private fun primary(): Expr {
@@ -294,16 +397,8 @@ class Parser(src: String, private val namespaces: Set<String>) {
                 ListE(items, tok.pos)
             }
             at("{") -> braces()
-            tok.kind == TK.IDENT && tok.text in namespaces && peek(1).text == "." && peek(2).kind == TK.IDENT && peek(3).text == "(" -> {
-                p += 3
-                val op = t[p - 1]
-                expect("(")
-                val params = expr()
-                val options = if (at(",")) { p++; expr() } else null
-                expect(")")
-                OpCall(tok.text, op.text, params, options, tok.pos)
-            }
-            tok.kind == TK.IDENT && tok.text in namespaces -> err("syntax.namespace", "'${tok.text}' is a catalog namespace; use it as ${tok.text}.operation(params)", tok.pos)
+            tok.kind == TK.IDENT && tok.text == "call" && peek(1).text == "(" -> call()
+            tok.kind == TK.IDENT && tok.text == "for" -> forExpr()
             tok.kind == TK.IDENT && tok.text in Stdlib.KEYWORDS -> err("syntax.keyword", "'${tok.text}' is a keyword", tok.pos)
             tok.kind == TK.IDENT -> { p++; Ref(tok.text, tok.pos) }
             else -> err("syntax.unexpected", "unexpected '${tok.text.ifEmpty { "end of input" }}'")
@@ -314,35 +409,23 @@ class Parser(src: String, private val namespaces: Set<String>) {
         if (tok.text.contains('.') || tok.text.contains('e') || tok.text.contains('E')) tok.text.toDouble()
         else tok.text.toLongOrNull()?.let { if (it in Int.MIN_VALUE..Int.MAX_VALUE) it.toInt() else it } ?: tok.text.toDouble()
 
-    /** `{` record | block | `{}` — decided by the token after the first identifier. */
+    /** `{` always opens a record; blocks are laid out by indentation (program, for body). */
     private fun braces(): Expr {
         val open = expect("{")
         if (at("}")) { p++; return RecordE(emptyList(), open.pos) }
-        if (peek().kind != TK.IDENT) err("syntax.brace", "a '{' starts a record ({ name: value }) or a block ({ name = value ... result })")
-        return when (peek(1).text) {
-            ":" -> {
-                val fields = ArrayList<Pair<String, Expr>>()
-                while (!at("}")) {
-                    val n = ident(); expect(":")
-                    fields += n.text to expr()
-                    if (at(",")) p++ else if (!at("}")) err("syntax.expected", "expected ',' or '}' in record")
-                }
-                expect("}")
-                RecordE(fields, open.pos)
-            }
-            "=" -> {
-                val bindings = ArrayList<Binding>()
-                while (peek().kind == TK.IDENT && peek(1).text == "=") {
-                    val n = t[p++]; expect("=")
-                    bindings += Binding(n.text, expr(), n.pos)
-                }
-                if (at("}")) err("syntax.blockResult", "a block ends with a result expression after its bindings", fix = "add the value the block produces, e.g. a record { ... }")
-                val result = expr()
-                expect("}")
-                BlockE(bindings, result, open.pos)
-            }
-            else -> err("syntax.brace", "after '{ ${peek().text}' expected ':' (record field) or '=' (block binding)")
+        if (peek().kind == TK.IDENT && peek(1).text == "=")
+            err("syntax.brace", "braces enclose a record { name: value }; bindings are not allowed inside them", peek().pos,
+                "put bindings on their own lines: at the top level, or indented under a 'for x in xs' line, with the result last")
+        if (peek().kind != TK.IDENT || peek(1).text != ":")
+            err("syntax.brace", "braces enclose a record { name: value }; found '${peek().text}'", peek().pos, "to group an expression use parentheses; a for body is laid out by indentation")
+        val fields = ArrayList<Pair<String, Expr>>()
+        while (!at("}")) {
+            val n = ident(); expect(":")
+            fields += n.text to expr()
+            if (at(",")) p++ else if (!at("}")) err("syntax.expected", "expected ',' or '}' in record")
         }
+        expect("}")
+        return RecordE(fields, open.pos)
     }
 
     // ── predicates ──────────────────────────────────────────────────────────
@@ -379,23 +462,32 @@ class Parser(src: String, private val namespaces: Set<String>) {
         val operand = expr()
         val cmpOps = setOf("==", "!=", "<", "<=", ">", ">=")
         if (peek().kind == TK.OP && peek().text in cmpOps) {
+            if (operand is MethodCall && operand.name in Stdlib.TEST && peek().text in setOf("==", "!=") && peek(1).kind == TK.IDENT && peek(1).text in setOf("true", "false")) {
+                // `.L.empty() == false`: a test compared with a boolean is the test or its negation
+                val negate = (peek().text == "==") != (peek(1).text == "true")
+                p += 2
+                val test = test(operand)
+                return if (negate) NotP(test, pos) else test
+            }
             val op = t[p++].text
             return Cmp(op, operand, expr(), pos)
         }
         if (atIdent("in")) { p++; return InP(operand, expr(), pos) }
         if (operand is MethodCall) {
-            if (operand.name in Stdlib.TEST) {
-                val arg = operand.args.singleOrNull()?.let { (it as? ExprArg)?.expr }
-                if (operand.name in setOf("present", "absent") && operand.args.isNotEmpty()) err("syntax.predicate", "${operand.name}() takes no argument", operand.pos)
-                if (operand.name !in setOf("present", "absent") && arg == null) err("syntax.predicate", "${operand.name}(s) takes one string argument", operand.pos)
-                return TestP(operand.target, operand.name, arg, operand.pos)
-            }
+            if (operand.name in Stdlib.TEST) return test(operand)
             if (operand.name == "any" || operand.name == "all") {
                 val inner = (operand.args.singleOrNull() as? PredArg)?.pred ?: err("syntax.predicate", "${operand.name}(...) takes one predicate", operand.pos)
                 return QuantP(operand.target, operand.name == "all", inner, operand.pos)
             }
         }
         err("syntax.predicate", "expected a predicate: <operand> == <operand>, <operand> in [...], .field.present(), .field.contains(\"x\"), .list.any(<pred>), joined with && || !", pos)
+    }
+
+    private fun test(operand: MethodCall): Pred {
+        val arg = operand.args.singleOrNull()?.let { (it as? ExprArg)?.expr }
+        if (operand.name in setOf("present", "absent", "empty") && operand.args.isNotEmpty()) err("syntax.predicate", "${operand.name}() takes no argument", operand.pos)
+        if (operand.name !in setOf("present", "absent", "empty") && arg == null) err("syntax.predicate", "${operand.name}(s) takes one string argument", operand.pos)
+        return TestP(operand.target, operand.name, arg, operand.pos)
     }
 }
 

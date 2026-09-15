@@ -15,7 +15,7 @@ import java.util.concurrent.atomic.AtomicReference
 
 /**
  * TOWL v3 runtime (TOWL_SPEC.md §§12–13). Values are plain JSON (null/Boolean/Number/String/List/
- * Map). Top-level bindings run as soon as their dependencies are values; `each` bodies with calls
+ * Map). Top-level bindings run as soon as their dependencies are values; `for` bodies with calls
  * run as a wave. Every error stops the program except a declared `tolerate` code, and a stopped
  * run returns the failure envelope with only complete values.
  */
@@ -96,10 +96,17 @@ class Runtime(
 
     private fun bindInputs(c: Checked, given: Map<String, Any?>): Map<String, Any?>? {
         val declared = c.program.inputs.associateBy { it.name }
-        val unknown = given.keys - declared.keys
+        val unknown = given.keys - declared.keys - c.implicitInputs.toSet()
         if (unknown.isNotEmpty()) return null
-        for (d in declared.values) if (d.name !in given || !Types.conforms(given[d.name], d.type)) return null
-        return given
+        val bound = HashMap(given)
+        // predefined inputs (TOWL §5): bound by the runtime when the program uses them (declared or not) and the caller did not
+        val now = java.time.OffsetDateTime.now(java.time.ZoneOffset.UTC).truncatedTo(java.time.temporal.ChronoUnit.SECONDS)
+        val usesNow = "now" in c.implicitInputs || declared["now"]?.type == TTimestamp
+        val usesToday = "today" in c.implicitInputs || declared["today"]?.type == TString
+        if ("now" !in bound && usesNow) bound["now"] = now.format(java.time.format.DateTimeFormatter.ISO_OFFSET_DATE_TIME).replace("+00:00", "Z")
+        if ("today" !in bound && usesToday) bound["today"] = now.toLocalDate().toString()
+        for (d in declared.values) if (d.name !in bound || !Types.conforms(bound[d.name], d.type)) return null
+        return bound
     }
 
     private fun inputFailure(c: Checked, given: Map<String, Any?>): Map<String, Any?> {
@@ -197,6 +204,9 @@ class Runtime(
         op.input?.fields?.forEach { (k, t) ->
             if (!Types.isNullable(t) && t !is TList && args.containsKey(k) && args[k] == null)
                 run.fail(Stop("data", "NullParameter", "parameter '$k' of ${op.id} was Null at runtime", op, e.pos, env.eachElement, env.inEach))
+            if (args[k] != null) Types.nullAtRequired(args[k], t, k)?.let { bad ->
+                run.fail(Stop("data", "NullParameter", "parameter '$bad' of ${op.id} was Null at runtime", op, e.pos, env.eachElement, env.inEach))
+            }
         }
         if (run.stopped.get()) throw Stop("cancelled", "Stopped", "stopped before ${op.id} was dispatched", op, e.pos)
         if (run.callCount.incrementAndGet() > maxCalls) run.fail(Stop("budget", "MaxCalls", "call budget of $maxCalls exceeded at ${op.id}", op, e.pos))
@@ -226,22 +236,22 @@ class Runtime(
         }
         log.info("[towl] call <- {}", op.id)
         if (mutate) run.mutations += linkedMapOf("line" to e.pos.line, "operation" to op.id, "element" to env.eachElement,
-            "params" to args, "options" to linkedMapOf("tolerate" to site.tolerate, "after" to site.after), "response" to raw)
+            "params" to args, "options" to linkedMapOf("tolerate" to site.tolerate), "response" to raw)
         return Types.normalize(raw, op.output)
     }
 
     private fun method(e: MethodCall, env: Env, run: Run): Any? {
         val target = eval(e.target, env, run)
         val name = e.name
-        if (name == "each") return each(e, target, env, run)
-        if (name in Stdlib.NULL) return target ?: eval((e.args[0] as ExprArg).expr, env, run)
+        if (name == "for") return forExpr(e, target, env, run)
         if (name in Stdlib.STR) return stringFn(name, target as? String, e, env, run)
+        if (name in Stdlib.TIME) return timeFn(name, target as? String, e, env, run)
         if (target == null && name in setOf("count")) return 0
         val list = (target as? List<*>) ?: emptyList<Any?>()
         val n = run.node(name, e.pos)
         run.bump(n, "in", list.size.toLong())
         fun path(i: Int) = (e.args[i] as ExprArg).expr
-        fun pathOf(el: Any?, i: Int = 0) = eval(path(i), env.element(el), run)
+        fun pathOf(el: Any?, i: Int = 0) = if (i >= e.args.size) el else eval(path(i), env.element(el), run) // no path: a list of scalars
         fun pred(el: Any?, i: Int = 0) = predicate((e.args[i] as PredArg).pred, env.element(el), run)
         val out: Any? = when (name) {
             "project" -> list.map { pathOf(it) }
@@ -259,6 +269,13 @@ class Runtime(
             "max" -> list.mapNotNull { pathOf(it) }.maxWithOrNull(::compareValues)
             "avg" -> list.mapNotNull { pathOf(it) as? Number }.let { ns -> if (ns.isEmpty()) null else ns.sumOf { it.toDouble() } / ns.size }
             "collect" -> list.mapNotNull { pathOf(it) }
+            "top", "bottom" -> {
+                val count = (eval(path(0), env, run) as? Number)?.toInt() ?: 0
+                val keyed = list.map { (if (e.args.size > 1) pathOf(it, 1) else it) to it }.filter { it.first != null }
+                val byKey = Comparator<Pair<Any?, Any?>> { a, b -> compareValues(a.first, b.first) }.let { if (name == "top") it.reversed() else it }
+                keyed.sortedWith(byKey.thenBy { canonical(it.second) }) // ties broken by canonical element order
+                    .take(count).mapIndexed { i, (_, el) -> linkedMapOf("rank" to i + 1, "value" to el) }
+            }
             "any" -> list.any { pred(it) }
             "all" -> list.all { pred(it) }
             else -> run.fail(Stop("other", "Internal", "unknown function $name", null, e.pos))
@@ -279,22 +296,38 @@ class Runtime(
         }
     }
 
-    // ── each: waves ─────────────────────────────────────────────────────────
+    private fun timeFn(name: String, s: String?, e: MethodCall, env: Env, run: Run): String? {
+        if (s == null) return null
+        val t = try { java.time.OffsetDateTime.parse(s).withOffsetSameInstant(java.time.ZoneOffset.UTC) } catch (x: java.time.format.DateTimeParseException) { return null }
+        val n = (e.args.firstOrNull()?.let { eval((it as ExprArg).expr, env, run) } as? Number)?.toLong() ?: 0L
+        val r = when (name) {
+            "minus_days" -> t.minusDays(n)
+            "minus_hours" -> t.minusHours(n)
+            "minus_minutes" -> t.minusMinutes(n)
+            "start_of_day" -> t.truncatedTo(java.time.temporal.ChronoUnit.DAYS)
+            "start_of_month" -> t.withDayOfMonth(1).truncatedTo(java.time.temporal.ChronoUnit.DAYS)
+            "date" -> return t.toLocalDate().toString()
+            else -> t
+        }
+        return r.format(java.time.format.DateTimeFormatter.ISO_OFFSET_DATE_TIME).replace("+00:00", "Z")
+    }
 
-    private fun each(e: MethodCall, target: Any?, env: Env, run: Run): Any? {
+    // ── for: waves ──────────────────────────────────────────────────────────
+
+    private fun forExpr(e: MethodCall, target: Any?, env: Env, run: Run): Any? {
         val lam = e.args[0] as LambdaArg
         val items = (target as? List<*>) ?: emptyList<Any?>()
         val isWave = e in run.c.waves
-        val n = run.node("each", e.pos)
+        val n = run.node("for", e.pos)
         run.bump(n, "in", items.size.toLong())
         if (!isWave) {
             val out = items.map { eval(lam.body, env.forElement(lam.param, it), run) }
             run.bump(n, "out", out.size.toLong()); return out
         }
-        if (items.size > maxWidth) run.fail(Stop("budget", "MaxWidth", "each over ${items.size} elements exceeds the width limit of $maxWidth", null, e.pos))
+        if (items.size > maxWidth) run.fail(Stop("budget", "MaxWidth", "for over ${items.size} elements exceeds the width limit of $maxWidth", null, e.pos))
         if (run.stopped.get()) throw Stop("cancelled", "Stopped", "stopped before wave started", null, e.pos)
         run.waves.incrementAndGet()
-        log.info("[towl] each over {} element(s), concurrency {}", items.size, maxConcurrency)
+        log.info("[towl] for over {} element(s), concurrency {}", items.size, maxConcurrency)
         val started = Array(items.size) { false }
         val results = arrayOfNulls<Any?>(items.size)
         val done = Array(items.size) { false }
@@ -344,7 +377,7 @@ class Runtime(
         is TestP -> {
             val v = eval(pr.operand, env, run)
             when (pr.fn) {
-                "present" -> v != null; "absent" -> v == null
+                "present" -> v != null; "absent" -> v == null; "empty" -> (v as? List<*>)?.isEmpty() ?: true
                 else -> { val s = v as? String; val a = pr.arg?.let { eval(it, env, run) as? String } ?: ""
                     s != null && when (pr.fn) { "contains" -> s.contains(a); "starts_with" -> s.startsWith(a); else -> s.endsWith(a) } }
             }
@@ -392,7 +425,8 @@ class Runtime(
         "tolerated" to run.tolerated.sortedBy { it["line"] as Int },
         "effects" to run.effects.values.sortedBy { it["line"] as Int },
         "nodes" to run.nodes.values.sortedBy { it["line"] as Int },
-        "accounting" to linkedMapOf("calls" to run.callCount.get(), "waves" to run.waves.get(), "wall_ms" to ms, "result_bytes" to run.resultBytes),
+        "accounting" to linkedMapOf("calls" to run.callCount.get(), "waves" to run.waves.get(), "wall_ms" to ms, "result_bytes" to run.resultBytes,
+            "tolerated" to run.tolerated.size),
     )
 
     private fun failure(run: Run, s: Stop, ms: Long): Map<String, Any?> = linkedMapOf(

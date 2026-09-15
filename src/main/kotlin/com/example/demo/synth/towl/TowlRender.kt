@@ -25,8 +25,7 @@ object Render {
     fun effectText(site: EffectSite): String {
         val mult = site.staticWidth?.let { "×$it" } ?: "×dynamic"
         val tol = if (site.tolerate.isEmpty()) "" else " tolerate ${site.tolerate}"
-        val after = if (site.after.isEmpty()) "" else " after ${site.after}"
-        return "${site.op.id} ${site.op.effect.name.lowercase()} $mult$tol$after"
+        return "${site.op.id} ${site.op.effect.name.lowercase()} $mult$tol"
     }
 
     fun report(c: Checked): Map<String, Any?> = linkedMapOf(

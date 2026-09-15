@@ -10,12 +10,12 @@ import com.fasterxml.jackson.annotation.JsonPropertyDescription
  * input schema teaches the shape, with three node forms —
  *
  *  - `value`: one TOWL expression in text;
- *  - `call` + `params` (+ `options`, `then`): an operation call whose parameters are a real JSON
+ *  - `call` + `args` (+ `options`, `then`): an operation call whose arguments are a real JSON
  *    object — a value of the form {"$": "expr"} inside it is an expression (a reference to a
- *    binding or each variable), everything else is literal data; `then` is postfix text applied to
- *    the call's result (".result.where(...)");
- *  - `each`: a fan-out with its own inner bindings and result, so the calls inside a body are also
- *    structured.
+ *    binding or map variable), everything else is literal data; `then` is postfix text applied to
+ *    the call's result (".result.where(...)"); renders as call("ns", "op", args, options);
+ *  - `for`: a fan-out with its own inner bindings and result, so the calls inside a body are also
+ *    structured; renders as `for as in over` with the body on indented lines.
  *
  * `render()` produces the equivalent text program; the same parser/checker run on it, and each
  * rendered line maps back to the node it came from so diagnostics say WHERE. Unknown members are
@@ -23,9 +23,9 @@ import com.fasterxml.jackson.annotation.JsonPropertyDescription
  */
 @JsonClassDescription(
     "A TOWL v3 program: optional inputs, ordered named bindings, and one result expression. " +
-        "A binding is EITHER { name, value: <expression text> } OR { name, call: \"ns.op\", params: {...JSON...}, options?, then? } " +
-        "OR { name, each: { over, as, bindings: [...], result } }. Inside params, {\"$\": \"expr\"} is an expression (a binding or " +
-        "each variable, e.g. {\"$\": \"ver\"} or {\"$\": \"s.link\"}); every other value is literal data.",
+        "A binding is EITHER { name, value: <expression text> } OR { name, call: \"ns.op\", args?: {...JSON...}, options?, then? } " +
+        "OR { name, for: { over, as, bindings: [...], result } }. Inside args, {\"$\": \"expr\"} is an expression (a binding or " +
+        "for variable, e.g. {\"$\": \"ver\"} or {\"$\": \"s.link\"}); every other value is literal data.",
 )
 class ProgramIr {
     @JsonPropertyDescription("language version; always 3")
@@ -96,7 +96,7 @@ class ProgramIr {
     }
 }
 
-@JsonClassDescription("one binding: exactly one of value | call | each, plus name")
+@JsonClassDescription("one binding: exactly one of value | call | for, plus name")
 class NodeIr {
     @JsonPropertyDescription("the name this value is bound to (letters, digits, underscore)")
     var name: String? = null
@@ -107,8 +107,8 @@ class NodeIr {
     @JsonPropertyDescription("form 2: operation to call, as namespace.operation (e.g. javadocs.get_latest_version)")
     var call: String? = null
 
-    @JsonPropertyDescription("form 2: the call's parameters as a JSON object. Literal data as-is; a reference to a binding or each variable as {\"$\": \"name\"} or {\"$\": \"s.link\"}")
-    var params: Map<String, Any?>? = null
+    @JsonPropertyDescription("form 2: the call's arguments as a JSON object (omit when the operation takes none). Literal data as-is; a reference to a binding or for variable as {\"$\": \"name\"} or {\"$\": \"s.link\"}")
+    var args: Map<String, Any?>? = null
 
     @JsonPropertyDescription("form 2: call options: tolerate (error codes that yield null) and after (binding names that must finish first)")
     var options: OptionsIr? = null
@@ -117,7 +117,7 @@ class NodeIr {
     var then: String? = null
 
     @JsonPropertyDescription("form 3: a fan-out over a list with its own bindings and result")
-    var each: EachIr? = null
+    var `for`: ForIr? = null
 
     @get:JsonIgnore
     val extras: MutableMap<String, Any?> = linkedMapOf()
@@ -125,25 +125,28 @@ class NodeIr {
     @JsonAnySetter
     fun any(key: String, value: Any?) { extras[key] = value }
 
-    internal fun forms() = listOfNotNull(value?.let { "value" }, call?.let { "call" }, each?.let { "each" })
+    internal fun forms() = listOfNotNull(value?.let { "value" }, call?.let { "call" }, `for`?.let { "for" })
 
     internal fun structural(out: MutableList<Diagnostic>, tag: String, namespaces: Set<String>) {
         if (name.isNullOrBlank()) out += Diagnostic("error", "syntax", "syntax.binding", null, "$tag has no name")
         val forms = forms()
-        if (forms.size != 1) out += Diagnostic("error", "syntax", "syntax.binding", null, "$tag must have exactly one of value, call, each; found $forms")
+        if (forms.size != 1) out += Diagnostic("error", "syntax", "syntax.binding", null, "$tag must have exactly one of value, call, for; found $forms")
+        for (old in listOf("each", "map")) if (old in extras) out += Diagnostic("error", "syntax", "syntax.binding", null, "$tag: '$old' is now 'for': { name, for: { over, as, bindings, result } }")
+        if ("params" in extras) out += Diagnostic("error", "syntax", "syntax.binding", null, "$tag: 'params' is now 'args'")
         if (call != null && !Regex("[A-Za-z_][A-Za-z0-9_]*\\.[A-Za-z_][A-Za-z0-9_]*").matches(call!!))
             out += Diagnostic("error", "syntax", "syntax.binding", null, "$tag: call must be namespace.operation, got '$call'")
         else if (call != null && namespaces.isNotEmpty() && call!!.substringBefore('.') !in namespaces)
             out += Diagnostic("error", "catalog", "catalog.unknownNamespace", null, "$tag: '${call!!.substringBefore('.')}' is not a namespace in this catalog, so ${call} does not exist",
                 "namespaces: ${namespaces.sorted().joinToString(", ")}; use only operations the helper listed and design the program without this one")
-        if (call == null && (params != null || options != null || then != null))
-            out += Diagnostic("error", "syntax", "syntax.binding", null, "$tag: params/options/then belong to a call binding", "add call: \"namespace.operation\"")
-        if (extras.isNotEmpty()) out += Diagnostic("error", "syntax", "syntax.binding", null, "$tag has unknown members ${extras.keys}", "a binding is { name, value } or { name, call, params, options?, then? } or { name, each }")
-        each?.let { e ->
-            if (e.over.isNullOrBlank()) out += Diagnostic("error", "syntax", "syntax.each", null, "$tag: each.over (the list expression) is required")
-            if (e.`as`.isNullOrBlank()) out += Diagnostic("error", "syntax", "syntax.each", null, "$tag: each.as (the element name) is required")
-            if (e.result.isNullOrBlank()) out += Diagnostic("error", "syntax", "syntax.each", null, "$tag: each.result (the body's value) is required")
-            e.bindings?.forEachIndexed { i, b -> b.structural(out, "binding '${b.name ?: "#$i"}' in each '$name'", namespaces) }
+        if (call == null && (args != null || options != null || then != null))
+            out += Diagnostic("error", "syntax", "syntax.binding", null, "$tag: args/options/then belong to a call binding", "add call: \"namespace.operation\"")
+        val unknown = extras.keys - setOf("each", "map", "params")
+        if (unknown.isNotEmpty()) out += Diagnostic("error", "syntax", "syntax.binding", null, "$tag has unknown members $unknown", "a binding is { name, value } or { name, call, args?, options?, then? } or { name, for }")
+        `for`?.let { e ->
+            if (e.over.isNullOrBlank()) out += Diagnostic("error", "syntax", "syntax.for", null, "$tag: for.over (the list expression) is required")
+            if (e.`as`.isNullOrBlank()) out += Diagnostic("error", "syntax", "syntax.for", null, "$tag: for.as (the element name) is required")
+            if (e.result.isNullOrBlank()) out += Diagnostic("error", "syntax", "syntax.for", null, "$tag: for.result (the body's value) is required")
+            e.bindings?.forEachIndexed { i, b -> b.structural(out, "binding '${b.name ?: "#$i"}' in for '$name'", namespaces) }
         }
     }
 
@@ -155,17 +158,19 @@ class NodeIr {
                 val opts = options?.let { o ->
                     val parts = ArrayList<String>()
                     o.tolerate?.let { parts += "tolerate: " + it.joinToString(", ", "[", "]") { c -> ProgramIr.quoteText(c) } }
-                    o.after?.let { parts += "after: " + (if (it.size == 1) it[0] else it.joinToString(", ", "[", "]")) }
-                    if (parts.isEmpty()) null else ", { ${parts.joinToString(", ")} }"
-                } ?: ""
-                r.add(head + call + "(" + ProgramIr.literal(params ?: emptyMap<String, Any?>()) + opts + ")" + (then ?: ""), tag)
+                    if (parts.isEmpty()) null else "{ ${parts.joinToString(", ")} }"
+                }
+                val ns = call!!.substringBefore('.'); val op = call!!.substringAfter('.')
+                val parts = arrayListOf(ProgramIr.quoteText(ns), ProgramIr.quoteText(op))
+                if (!args.isNullOrEmpty() || opts != null) parts += ProgramIr.literal(args ?: emptyMap<String, Any?>())
+                if (opts != null) parts += opts
+                r.add(head + "call(" + parts.joinToString(", ") + ")" + (then ?: ""), tag)
             }
-            each != null -> {
-                val e = each!!
-                r.add(head + "${e.over}.each(${e.`as`} => {", tag)
-                e.bindings?.forEachIndexed { i, b -> b.render(r, "$indent  ", "binding '${b.name ?: "#$i"}' in each '$name'") }
-                r.add("$indent  ${e.result}", "result of each '$name'")
-                r.add("$indent})", tag)
+            `for` != null -> {
+                val e = `for`!!
+                r.add(head + "for ${e.`as`} in ${e.over}", tag)
+                e.bindings?.forEachIndexed { i, b -> b.render(r, "$indent  ", "binding '${b.name ?: "#$i"}' in for '$name'") }
+                r.add("$indent  ${e.result}", "result of for '$name'")
             }
             else -> r.add(head, tag)
         }
@@ -175,13 +180,10 @@ class NodeIr {
 class OptionsIr {
     @JsonPropertyDescription("provider error codes at this call that mean 'absent'; the call yields null instead of stopping the program")
     var tolerate: List<String>? = null
-
-    @JsonPropertyDescription("names of bindings that must finish before this call is dispatched (ordering without a data dependency)")
-    var after: List<String>? = null
 }
 
-@JsonClassDescription("a fan-out: run the bindings once per element of 'over', binding the element to 'as'; the value is the list of each body's result")
-class EachIr {
+@JsonClassDescription("a fan-out: run the bindings once per element of 'over', naming the element 'as'; the value is the list of the bodies' results")
+class ForIr {
     @JsonPropertyDescription("the list expression to fan out over (TOWL text), e.g. \"syms\" or \"regions.where(.active == true)\"")
     var over: String? = null
 

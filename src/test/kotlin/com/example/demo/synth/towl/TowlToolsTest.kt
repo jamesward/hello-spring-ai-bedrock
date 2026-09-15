@@ -18,20 +18,21 @@ class TowlToolsTest {
     /** Mirrors the framework's conversion of tool-call arguments into the structured program. */
     private fun ir(json: String): ProgramIr = mapper.readValue(json, ProgramIr::class.java)
 
+    /** Text-form bindings plus a laid-out for body inside the result text: the value string carries its own newlines. */
     private val PROGRAM = ir("""
         { "towl": 3, "description": "docs",
           "bindings": [
-            { "name": "ver",  "value": "javadocs.get_latest_version({ groupId: \"g\", artifactId: \"a\" }).result" },
-            { "name": "syms", "value": "javadocs.list_javadoc_symbols({ groupId: \"g\", artifactId: \"a\", version: ver }).result.where(.fqn.contains(\"Validator\"))" }
+            { "name": "ver",  "value": "call(\"javadocs\", \"get_latest_version\", { groupId: \"g\", artifactId: \"a\" }).result" },
+            { "name": "syms", "value": "call(\"javadocs\", \"list_javadoc_symbols\", { groupId: \"g\", artifactId: \"a\", version: ver }).result.where(.fqn.contains(\"Validator\"))" }
           ],
-          "result": "syms.each(s => { doc = javadocs.get_javadoc_symbol({ groupId: \"g\", artifactId: \"a\", version: ver, link: s.link })  { class: s.fqn.after_last(\".\"), summary: llm.summarize({ text: doc }) } })" }
+          "result": "for s in syms\n  doc = call(\"javadocs\", \"get_javadoc_symbol\", { groupId: \"g\", artifactId: \"a\", version: ver, link: s.link })\n  { class: s.fqn.after_last(\".\"), summary: call(\"llm\", \"summarize\", { text: doc }) }" }
     """)
 
     @Test fun `towlPlanHelper returns the v3 language guide plus matching operations with types`() {
         val (_, t) = tools()
         val out = json(t.towlPlanHelper(listOf("javadoc symbols", "summarize text"), null, null))
         val guide = out["language"] as String
-        assertTrue(guide.contains("\"bindings\"") && guide.contains(".each(x => body)") && guide.contains("tolerate"), guide)
+        assertTrue(guide.contains("\"bindings\"") && guide.contains("for x in list") && guide.contains("tolerate"), guide)
         assertTrue(!guide.contains("truncate"), "no truncation anywhere in the guide")
         @Suppress("UNCHECKED_CAST") val matched = out["matched"] as List<Map<String, Any?>>
         val names = matched.map { it["operation"] }
@@ -80,13 +81,17 @@ class TowlToolsTest {
     @Test fun `calling an operation in a namespace the catalog lacks is diagnosed as such, in both forms`() {
         val t = TowlTools(TowlService(withoutLlm()))
         // structured form: caught before parsing
-        val s = json(t.validateTowlPlan(ir("""{ "towl": 3, "bindings": [ { "name": "x", "call": "llm.summarize", "params": { "text": "t" } } ], "result": "x" }""")))
+        val s = json(t.validateTowlPlan(ir("""{ "towl": 3, "bindings": [ { "name": "x", "call": "llm.summarize", "args": { "text": "t" } } ], "result": "x" }""")))
         @Suppress("UNCHECKED_CAST") val sd = (s["diagnostics"] as List<Map<String, Any?>>).single()
         assertEquals("catalog.unknownNamespace", sd["code"]); assertTrue((sd["fix"] as String).contains("namespaces: javadocs"), sd.toString())
-        // text form: the parser explains it is not a namespace rather than "not a function"
-        val v = json(t.validateTowlPlan(ir("""{ "towl": 3, "bindings": [ { "name": "x", "value": "llm.summarize({ text: \"t\" })" } ], "result": "x" }""")))
+        // text form: the checker explains it is not a namespace rather than "not a function"
+        val v = json(t.validateTowlPlan(ir("""{ "towl": 3, "bindings": [ { "name": "x", "value": "call(\"llm\", \"summarize\", { text: \"t\" })" } ], "result": "x" }""")))
         @Suppress("UNCHECKED_CAST") val vd = (v["diagnostics"] as List<Map<String, Any?>>).single()
         assertEquals("catalog.unknownNamespace", vd["code"]); assertTrue((vd["message"] as String).contains("'llm' is not a namespace"), vd.toString())
+        // the retired method form gets the call form as its fix
+        val m = json(t.validateTowlPlan(ir("""{ "towl": 3, "bindings": [ { "name": "x", "value": "llm.summarize({ text: \"t\" })" } ], "result": "x" }""")))
+        @Suppress("UNCHECKED_CAST") val md = (m["diagnostics"] as List<Map<String, Any?>>).single()
+        assertEquals("syntax.callForm", md["code"]); assertTrue((md["fix"] as String).contains("""call("llm", "summarize", { ... })"""), md.toString())
     }
 
     @Test fun `the guide can be omitted on repeat searches`() {
@@ -117,7 +122,7 @@ class TowlToolsTest {
     @Test fun `the generated tool input schema teaches the program skeleton`() {
         val method = TowlTools::class.java.methods.single { it.name == "runTowlPlan" }
         val schema = org.springframework.ai.util.json.schema.JsonSchemaGenerator.generateForMethodInput(method)
-        for (key in listOf("\"towl\"", "\"description\"", "\"inputs\"", "\"bindings\"", "\"name\"", "\"value\"", "\"call\"", "\"params\"", "\"then\"", "\"each\"", "\"over\"", "\"tolerate\"", "\"result\""))
+        for (key in listOf("\"towl\"", "\"description\"", "\"inputs\"", "\"bindings\"", "\"name\"", "\"value\"", "\"call\"", "\"args\"", "\"then\"", "\"for\"", "\"over\"", "\"tolerate\"", "\"result\""))
             assertTrue(schema.contains(key), "$key missing from generated schema:\n$schema")
         assertTrue(schema.contains("one TOWL expression in text"), "field descriptions must reach the schema:\n$schema")
         assertTrue(!schema.contains("\"extras\""), "captured unknowns must not leak into the schema")
@@ -125,7 +130,7 @@ class TowlToolsTest {
 
     @Test fun `diagnostics come back as structured data with fixes and a location, not exceptions`() {
         val (catalog, t) = tools()
-        val out = json(t.validateTowlPlan(ir("""{ "towl": 3, "bindings": [ { "name": "v", "value": "javadocs.get_version({ group: \"g\" })" } ], "result": "v.result" }""")))
+        val out = json(t.validateTowlPlan(ir("""{ "towl": 3, "bindings": [ { "name": "v", "value": "call(\"javadocs\", \"get_version\", { group: \"g\" })" } ], "result": "v.result" }""")))
         assertEquals(false, out["valid"])
         @Suppress("UNCHECKED_CAST") val d = out["diagnostics"] as List<Map<String, Any?>>
         val err = d.single { it["severity"] == "error" }
@@ -135,30 +140,30 @@ class TowlToolsTest {
         assertEquals(0, catalog.calls.size)
     }
 
-    /** The same program in the fully structured form: calls with JSON params and an each node. */
+    /** The same program in the fully structured form: calls with JSON args and a map node. */
     private val STRUCTURED = ir("""
         { "towl": 3, "description": "docs",
           "bindings": [
-            { "name": "ver",  "call": "javadocs.get_latest_version", "params": { "groupId": "g", "artifactId": "a" }, "then": ".result" },
-            { "name": "syms", "call": "javadocs.list_javadoc_symbols", "params": { "groupId": "g", "artifactId": "a", "version": {"$": "ver"} },
+            { "name": "ver",  "call": "javadocs.get_latest_version", "args": { "groupId": "g", "artifactId": "a" }, "then": ".result" },
+            { "name": "syms", "call": "javadocs.list_javadoc_symbols", "args": { "groupId": "g", "artifactId": "a", "version": {"$": "ver"} },
               "then": ".result.where(.fqn.contains(\"Validator\"))" },
-            { "name": "digests", "each": { "over": "syms", "as": "s",
+            { "name": "digests", "for": { "over": "syms", "as": "s",
               "bindings": [
-                { "name": "doc", "call": "javadocs.get_javadoc_symbol", "params": { "groupId": "g", "artifactId": "a", "version": {"$": "ver"}, "link": {"$": "s.link"} },
+                { "name": "doc", "call": "javadocs.get_javadoc_symbol", "args": { "groupId": "g", "artifactId": "a", "version": {"$": "ver"}, "link": {"$": "s.link"} },
                   "options": { "tolerate": ["NotFound"] } },
-                { "name": "sum", "call": "llm.summarize", "params": { "text": {"$": "doc.or(\"\")"}, "focus": "class purpose" } }
+                { "name": "sum", "call": "llm.summarize", "args": { "text": {"$": "doc"}, "focus": "class purpose" } }
               ],
               "result": "{ class: s.fqn.after_last(\".\"), summary: sum }" } }
           ],
           "result": "digests" }
     """)
 
-    @Test fun `structured call and each forms render, check and run like the text form`() {
+    @Test fun `structured call and map forms render, check and run like the text form`() {
         val (catalog, t) = tools()
         val rendered = STRUCTURED.render()
-        assertTrue(rendered.source.contains("""syms = javadocs.list_javadoc_symbols({ groupId: "g", artifactId: "a", version: ver }).result.where(.fqn.contains("Validator"))"""), rendered.source)
-        assertTrue(rendered.source.contains("""{ tolerate: ["NotFound"] }"""), rendered.source)
-        assertEquals("binding 'doc' in each 'digests'", rendered.whereByLine.entries.single { it.value.startsWith("binding 'doc'") }.value)
+        assertTrue(rendered.source.contains("""syms = call("javadocs", "list_javadoc_symbols", { groupId: "g", artifactId: "a", version: ver }).result.where(.fqn.contains("Validator"))"""), rendered.source)
+        assertTrue(rendered.source.contains("""digests = for s in syms""") && rendered.source.contains("""{ tolerate: ["NotFound"] })"""), rendered.source)
+        assertEquals("binding 'doc' in for 'digests'", rendered.whereByLine.entries.single { it.value.startsWith("binding 'doc'") }.value)
         val out = json(t.runTowlPlan(STRUCTURED, null))
         assertEquals(true, out["valid"]); assertEquals("ok", out["status"])
         assertEquals(3, (out["value"] as List<*>).size)
@@ -168,11 +173,11 @@ class TowlToolsTest {
         assertEquals("2.22.2", listArgs["version"], "the {\"$\": \"ver\"} reference resolved to the binding's value")
     }
 
-    @Test fun `a plain string that names a binding inside params is warned about`() {
+    @Test fun `a plain string that names a binding inside args is warned about`() {
         val (_, t) = tools()
         val out = json(t.validateTowlPlan(ir("""{ "towl": 3, "bindings": [
-            { "name": "ver", "call": "javadocs.get_latest_version", "params": { "groupId": "g", "artifactId": "a" }, "then": ".result" },
-            { "name": "syms", "call": "javadocs.list_javadoc_symbols", "params": { "groupId": "g", "artifactId": "a", "version": "ver" }, "then": ".result" } ],
+            { "name": "ver", "call": "javadocs.get_latest_version", "args": { "groupId": "g", "artifactId": "a" }, "then": ".result" },
+            { "name": "syms", "call": "javadocs.list_javadoc_symbols", "args": { "groupId": "g", "artifactId": "a", "version": "ver" }, "then": ".result" } ],
             "result": "syms" }""")))
         // 'ver' is then unreferenced (an error) and the literal is flagged: together they point at the mistake
         assertEquals(false, out["valid"])
@@ -185,8 +190,8 @@ class TowlToolsTest {
         // the live turn-2 failure: the model separated block bindings with ';'
         val (_, t) = tools()
         val out = json(t.runTowlPlan(ir("""{ "towl": 3, "bindings": [
-            { "name": "syms", "call": "javadocs.list_javadoc_symbols", "params": { "groupId": "g", "artifactId": "a", "version": "1" }, "then": ".result" },
-            { "name": "out", "value": "syms.each(s => { a = s.fqn.after_last(\".\"); b = s.link; { a: a, b: b } })" } ],
+            { "name": "syms", "call": "javadocs.list_javadoc_symbols", "args": { "groupId": "g", "artifactId": "a", "version": "1" }, "then": ".result" },
+            { "name": "out", "value": "for s in syms\n  a = s.fqn.after_last(\".\"); b = s.link\n  { a: a, b: b }" } ],
             "result": "out" }"""), null))
         assertEquals("ok", out["status"], out.toString())
     }
@@ -195,16 +200,19 @@ class TowlToolsTest {
         val (_, t) = tools()
         val out = json(t.validateTowlPlan(ir("""{ "towl": 3, "bindings": [
             { "name": "a", "value": "1", "call": "x.y" },
-            { "name": "b", "params": { "k": 1 } },
+            { "name": "b", "args": { "k": 1 } },
             { "name": "c", "call": "not-an-op" },
-            { "name": "d", "each": { "over": "xs" } } ],
+            { "name": "d", "for": { "over": "xs" } },
+            { "name": "e", "each": { "over": "xs", "as": "x", "result": "x" } },
+            { "name": "f", "call": "javadocs.get_latest_version", "params": { "groupId": "g" } } ],
             "result": "a" }""")))
         assertEquals(false, out["valid"])
         @Suppress("UNCHECKED_CAST") val msgs = (out["diagnostics"] as List<Map<String, Any?>>).map { it["message"] as String }
-        assertTrue(msgs.any { it.contains("exactly one of value, call, each") }, msgs.toString())
-        assertTrue(msgs.any { it.contains("params/options/then belong to a call binding") }, msgs.toString())
+        assertTrue(msgs.any { it.contains("exactly one of value, call, for") }, msgs.toString())
+        assertTrue(msgs.any { it.contains("args/options/then belong to a call binding") }, msgs.toString())
         assertTrue(msgs.any { it.contains("call must be namespace.operation") }, msgs.toString())
-        assertTrue(msgs.any { it.contains("each.as") } && msgs.any { it.contains("each.result") }, msgs.toString())
+        assertTrue(msgs.any { it.contains("for.as") } && msgs.any { it.contains("for.result") }, msgs.toString())
+        assertTrue(msgs.any { it.contains("'each' is now 'for'") } && msgs.any { it.contains("'params' is now 'args'") }, msgs.toString())
     }
 
     @Test fun `structural slips are reported with a corrective message before parsing`() {

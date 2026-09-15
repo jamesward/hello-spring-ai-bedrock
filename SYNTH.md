@@ -9,33 +9,31 @@ program as plain text, and the deterministic runtime executes it. Language: `aws
 ## Example program (what the LLM writes)
 
 The tools take the program in TOWL's structured form (§3.1). A binding is `{ name, value }` (an
-expression), `{ name, call, params, options?, then? }` (an operation call whose `params` is a real
-JSON object; `{"$": "ver"}` marks a reference), or `{ name, each: { over, as, bindings, result } }`
+expression), `{ name, call, args?, options?, then? }` (an operation call whose `args` is a real
+JSON object; `{"$": "ver"}` marks a reference), or `{ name, for: { over, as, bindings, result } }`
 (a fan-out with its own structured bindings). The validator renders it to the text below and
 annotates it:
 
 ```text
 towl 3 "classes in the latest jackson-databind that involve polymorphic type validation"
-ver  = javadocs.get_latest_version({ groupId: "com.fasterxml.jackson.core", artifactId: "jackson-databind" }).result
-syms = javadocs.list_javadoc_symbols({ groupId: "com.fasterxml.jackson.core", artifactId: "jackson-databind", version: ver })
+ver  = call("javadocs", "get_latest_version", { groupId: "com.fasterxml.jackson.core", artifactId: "jackson-databind" }).result
+syms = call("javadocs", "list_javadoc_symbols", { groupId: "com.fasterxml.jackson.core", artifactId: "jackson-databind", version: ver })
          .result.where(.fqn.contains("Polymorphic"))
-syms.each(s => {
-  doc = javadocs.get_javadoc_symbol({ groupId: "com.fasterxml.jackson.core", artifactId: "jackson-databind",
-                                      version: ver, link: s.link })
-  { class: s.fqn.after_last("."), summary: llm.summarize({ text: doc }) }
-})
+for s in syms
+  doc = call("javadocs", "get_javadoc_symbol", { groupId: "com.fasterxml.jackson.core", artifactId: "jackson-databind",
+                                                version: ver, link: s.link })
+  { class: s.fqn.after_last("."), summary: call("llm", "summarize", { text: doc }) }
 ```
 
 `validateTowlPlan` returns the typed rendering the reviewer sees:
 
 ```text
-ver  = javadocs.get_latest_version({ ... }).result        // ver: string; javadocs.get_latest_version read ×1
-syms = javadocs.list_javadoc_symbols({ ... })             // syms: list[{ fqn: string, link: string, ... }]; ... read ×1
+ver  = call("javadocs", "get_latest_version", { ... }).result        // ver: string; javadocs.get_latest_version read ×1
+syms = call("javadocs", "list_javadoc_symbols", { ... })             // syms: list[{ fqn: string, link: string, ... }]; ... read ×1
          .result.where(.fqn.contains("Polymorphic"))
-syms.each(s => {                                          // wave ×dynamic; result: list[{ class: string, summary: string }]
-  doc = javadocs.get_javadoc_symbol({ ... })              // javadocs.get_javadoc_symbol read ×dynamic
-  { class: s.fqn.after_last("."), summary: llm.summarize({ text: doc }) }   // llm.summarize read ×dynamic
-})
+for s in syms                                                          // wave ×dynamic; result: list[{ class: string, summary: string }]
+  doc = call("javadocs", "get_javadoc_symbol", { ... })              // javadocs.get_javadoc_symbol read ×dynamic
+  { class: s.fqn.after_last("."), summary: call("llm", "summarize", { text: doc }) }   // llm.summarize read ×dynamic
 ```
 
 The same program as the tool receives it:
@@ -43,13 +41,13 @@ The same program as the tool receives it:
 ```json
 { "towl": 3, "description": "…",
   "bindings": [
-    { "name": "ver",  "call": "javadocs.get_latest_version", "params": { "groupId": "com.fasterxml.jackson.core", "artifactId": "jackson-databind" }, "then": ".result" },
-    { "name": "syms", "call": "javadocs.list_javadoc_symbols", "params": { "groupId": "…", "artifactId": "…", "version": {"$": "ver"} },
+    { "name": "ver",  "call": "javadocs.get_latest_version", "args": { "groupId": "com.fasterxml.jackson.core", "artifactId": "jackson-databind" }, "then": ".result" },
+    { "name": "syms", "call": "javadocs.list_javadoc_symbols", "args": { "groupId": "…", "artifactId": "…", "version": {"$": "ver"} },
       "then": ".result.where(.fqn.contains(\"Polymorphic\"))" },
-    { "name": "digests", "each": { "over": "syms", "as": "s",
+    { "name": "digests", "for": { "over": "syms", "as": "s",
       "bindings": [
-        { "name": "doc", "call": "javadocs.get_javadoc_symbol", "params": { "groupId": "…", "artifactId": "…", "version": {"$": "ver"}, "link": {"$": "s.link"} } },
-        { "name": "sum", "call": "llm.summarize", "params": { "text": {"$": "doc"} } } ],
+        { "name": "doc", "call": "javadocs.get_javadoc_symbol", "args": { "groupId": "…", "artifactId": "…", "version": {"$": "ver"}, "link": {"$": "s.link"} } },
+        { "name": "sum", "call": "llm.summarize", "args": { "text": {"$": "doc"} } } ],
       "result": "{ class: s.fqn.after_last(\".\"), summary: sum }" } } ],
   "result": "digests" }
 ```
@@ -58,10 +56,10 @@ The same program as the tool receives it:
 
 | v1 (JSON plans) | v3 (text programs) |
 |---|---|
-| `{"let": {...}, "source": {"call": ...}, "forEach": ...}` with tagged nodes | `{ bindings: [{ name, value }], result }` skeleton; each value is `ns.op({...}).where(pred).each(x => ...)` text — types inferred, no tags |
+| `{"let": {...}, "source": {"call": ...}, "forEach": ...}` with tagged nodes | `{ bindings: [{ name, value }], result }` skeleton; each value is for x in `ns.op({...}).where(pred) ...` text — types inferred, no tags |
 | registry of functions/aggregators, `{"afterLast": [...]}` | fixed stdlib: `project flat flatten where compact distinct concat group single count sum avg min max collect any all after_last before_first lower upper` |
 | `onError: fail | skip | collect`, `status: partial` | every error stops the program; `{ tolerate: ["Code"] }` on a call yields `null`; failure envelope lists `completed`, `fanout[].completed/failed/interrupted/not_started`, `mutations`; no partial success |
-| `{"path": ""}` text truncated with `take` | no truncation anywhere; `llm.summarize({ text })` is an explicit, reported operation |
+| `{"path": ""}` text truncated with `take` | no truncation anywhere; `call("llm", "summarize", { text })` is an explicit, reported operation |
 | cardinality metadata (ONE/MANY, subject path) | JSON Schema → TOWL types; a list is just a `list[T]` member (`.result`) |
 | `explain` waves text | typed rendering + effect table (`Render`) |
 
@@ -77,7 +75,7 @@ tokens" include them. The run envelope's `effects` also lists `llm.summarize` wi
 { "valid": true, "status": "ok", "type": "list[{ class: string, summary: string }]",
   "value": [ ... ],
   "tolerated": [], "effects": [ { "operation": "javadocs.get_javadoc_symbol", "effect": "read", "calls": 7 }, ... ],
-  "nodes": [ { "node": "where", "line": 3, "in": 618, "out": 7 }, { "node": "each", "line": 5, "in": 7, "out": 7 } ],
+  "nodes": [ { "node": "where", "line": 3, "in": 618, "out": 7 }, { "node": "for", "line": 5, "in": 7, "out": 7 } ],
   "accounting": { "calls": 16, "waves": 1, "wall_ms": 4210 } }
 ```
 

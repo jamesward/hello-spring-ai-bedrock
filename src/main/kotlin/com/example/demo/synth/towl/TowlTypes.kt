@@ -53,19 +53,34 @@ object Types {
         else -> true
     }
 
-    /** `from` may be used where `to` is expected. The only coercion is int -> number. */
-    fun assignable(from: Type, to: Type): Boolean = when {
+    /**
+     * `from` may be used where `to` is expected. The only coercion is int -> number.
+     * [relaxed] is TOWL §6.1's parameter rule: `T | Null` may be supplied where `T` is required, at any depth,
+     * with a runtime `data` check ([nullAtRequired]).
+     */
+    fun assignable(from: Type, to: Type, relaxed: Boolean = false): Boolean = when {
         from == to -> true
         from == TError || to == TError -> true
         to == TJson -> true
         from == TInt && to == TNumber -> true
-        to is TNullable -> from == TNull || assignable(stripNull(from), to.inner)
-        from is TNullable -> false
-        from is TList && to is TList -> assignable(from.element, to.element)
+        to is TNullable -> from == TNull || assignable(stripNull(from), to.inner, relaxed)
+        from is TNullable -> relaxed && assignable(from.inner, to, relaxed)
+        from is TList && to is TList -> assignable(from.element, to.element, relaxed)
         from is TRecord && to is TRecord ->
-            to.fields.all { (k, tt) -> from.fields[k]?.let { assignable(it, tt) } ?: isNullable(tt) } &&
+            to.fields.all { (k, tt) -> from.fields[k]?.let { assignable(it, tt, relaxed) } ?: (isNullable(tt) || tt is TList) } &&
                 from.fields.keys.all { it in to.fields }
         else -> false
+    }
+
+    /** First path where a null sits in a non-nullable position of [t] (the runtime side of the relaxation). */
+    fun nullAtRequired(value: Any?, t: Type, path: String): String? {
+        if (value == null) return if (isNullable(t) || t == TJson || t == TError || t is TList) null else path
+        return when {
+            t is TNullable -> nullAtRequired(value, t.inner, path)
+            t is TList && value is List<*> -> value.withIndex().firstNotNullOfOrNull { (i, v) -> nullAtRequired(v, t.element, "$path[$i]") }
+            t is TRecord && value is Map<*, *> -> value.entries.firstNotNullOfOrNull { (k, v) -> t.fields[k]?.let { ft -> nullAtRequired(v, ft, if (path.isEmpty()) "$k" else "$path.$k") } }
+            else -> null
+        }
     }
 
     /** Join for list-literal elements and conditional branches: equal, or int/number. */

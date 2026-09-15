@@ -77,7 +77,7 @@ class TowlTools(private val service: TowlService) {
             "listing EVERY problem; fix them all and retry.",
     )
     fun validateTowlPlan(
-        @ToolParam(description = "the program as a STRUCTURED object: { towl: 3, description, inputs?, bindings: [...], result }; a binding is { name, value } | { name, call, params, options?, then? } | { name, each: { over, as, bindings, result } }") plan: ProgramIr,
+        @ToolParam(description = "the program as a STRUCTURED object: { towl: 3, description, inputs?, bindings: [...], result }; a binding is { name, value } | { name, call, args?, options?, then? } | { name, for: { over, as, bindings, result } }") plan: ProgramIr,
     ): String = withChecked(plan) { linkedMapOf<String, Any?>("valid" to true).apply { putAll(Render.report(it)) } }
 
     @Tool(
@@ -91,7 +91,7 @@ class TowlTools(private val service: TowlService) {
             "whether to rerun, rewrite, or declare tolerate for the reported code.",
     )
     fun runTowlPlan(
-        @ToolParam(description = "the program as a STRUCTURED object: { towl: 3, description, inputs?, bindings: [...], result }; a binding is { name, value } | { name, call, params, options?, then? } | { name, each: { over, as, bindings, result } }") plan: ProgramIr,
+        @ToolParam(description = "the program as a STRUCTURED object: { towl: 3, description, inputs?, bindings: [...], result }; a binding is { name, value } | { name, call, args?, options?, then? } | { name, for: { over, as, bindings, result } }") plan: ProgramIr,
         @ToolParam(required = false, description = "values for the program's declared inputs, by name") inputs: Map<String, Any?>?,
     ): String = withChecked(plan) { checked ->
         linkedMapOf<String, Any?>("valid" to true).apply { putAll(service.execute(checked, inputs ?: emptyMap())) }
@@ -126,9 +126,9 @@ class TowlTools(private val service: TowlService) {
                no operation and never will — do not search for it again, design the program without
                it (e.g. return the text as-is, or fewer items). Read the returned language guide.
             2. Author one complete TOWL v3 program as a STRUCTURED OBJECT: ordered bindings plus a
-               result. Prefer the structured binding forms — { name, call, params, then } for an
-               operation call (params is a real JSON object; references are {"$": "name"}) and
-               { name, each: { over, as, bindings, result } } for a fan-out — and { name, value } for
+               result. Prefer the structured binding forms — { name, call, args, then } for an
+               operation call (args is a real JSON object; references are {"$": "name"}) and
+               { name, for: { over, as, bindings, result } } for a fan-out — and { name, value } for
                pure transforms. Keep the result SMALL: project only what the answer needs; if a
                document is long and the catalog has a summarize operation, include it in the program.
             3. Run it with runTowlPlan (it type-checks first). Use validateTowlPlan to check without executing.
