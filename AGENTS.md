@@ -17,7 +17,7 @@ its `get_latest_version` for version lookups and its source/doc tools for API qu
 
 ## Build & test
 
-- `./gradlew build` (what CI runs, Java 21).
+- `./gradlew build` (what CI runs, Java 25).
 - `./gradlew bootRun` runs the app. It calls Bedrock and needs `AWS_BEARER_TOKEN_BEDROCK`, so it's
   paid and manual only. Never run it in the maintenance routine.
 
