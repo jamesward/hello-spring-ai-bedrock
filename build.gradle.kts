@@ -18,7 +18,7 @@ dependencies {
     implementation("org.springframework.ai:spring-ai-starter-model-bedrock-converse")
 
     // Agent Skills, extracted with ./gradlew extractSkillsJars
-    skill("com.jamesward:skills:0.0.6")
+    skill("com.jamesward:skills:0.0.10")
 }
 
 skillsjars {
