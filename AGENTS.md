@@ -19,9 +19,9 @@ its `get_latest_version` for version lookups and its source/doc tools for API qu
 
 - `./gradlew build` (what CI runs, Java 21).
 - `./gradlew bootRun` runs the app. It calls Bedrock and needs `AWS_BEARER_TOKEN_BEDROCK`, so it's
-  paid and manual only. Never run it in the daily routine.
+  paid and manual only. Never run it in the maintenance routine.
 
 ## Branches
 
-`main` is the default branch and the only one the daily routine maintains. Feature branches (for
+`main` is the default branch and the only one the maintenance routine maintains. Feature branches (for
 example `towl-advisor`) are experiments: don't touch them.
