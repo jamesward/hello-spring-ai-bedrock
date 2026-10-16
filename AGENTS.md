@@ -13,13 +13,18 @@ only project-specific facts and exceptions.
 ## MCP
 
 `javadocs` (https://www.javadocs.dev/mcp), configured in `.mcp.json` / `.kiro/settings/mcp.json`. Use
-its `get_latest_version` for version lookups and its source/doc tools for API questions.
+its `get_latest_version` for version lookups and its source/doc tools for API questions. In Claude
+Code these tools are deferred; load them with ToolSearch before use.
 
 ## Build & test
 
 - `./gradlew build` (what CI runs, Java 25).
 - `./gradlew bootRun` runs the app. It calls Bedrock and needs `AWS_BEARER_TOKEN_BEDROCK`, so it's
   paid and manual only. Never run it in the maintenance routine.
+
+## Maintenance routine
+
+`.factory/MAINTENANCE.md`, run on a schedule configured outside this repo.
 
 ## Branches
 
